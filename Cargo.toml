@@ -1,0 +1,20 @@
+[package]
+name = "ghosterm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "3a418c9ea586c1862a8c3a49d6a998436afc8957", features = [
+    "anyhow",
+    "dylibs",
+    "sync",
+    "biased",
+    "imbl",
+] }
+abi_stable = "0.11.3"
+anyhow = "1.0"
+portable-pty = "0.9.0"
+futures = "0.3"
+futures-time = "3"
+tokio = { version = "1", features = ["sync", "time"] }
+parking_lot = "0.13"
