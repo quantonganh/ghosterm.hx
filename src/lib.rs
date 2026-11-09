@@ -1,17 +1,37 @@
 use std::io::Write;
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 
-use abi_stable::std_types::{RBoxError, RResult};
+use abi_stable::std_types::{RBoxError, RResult, RVec};
 use anyhow::{Context, Result};
+use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
+use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::style::Underline;
+use libghostty_vt::terminal::Terminal;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use steel::declare_module;
 use steel::rvals::Custom;
-use steel::steel_vm::ffi::{FFIModule, FFIValue, FfiFuture, FfiFutureExt, IntoFFIVal, RegisterFFIFn};
+use steel::steel_vm::ffi::{
+    FFIModule, FFIValue, FfiFuture, FfiFutureExt, IntoFFIVal, RegisterFFIFn,
+};
 use tokio::sync::mpsc;
+
+const ATTR_BOLD: u16 = 1 << 0;
+const ATTR_ITALIC: u16 = 1 << 1;
+const ATTR_FAINT: u16 = 1 << 2;
+const ATTR_BLINK: u16 = 1 << 3;
+const ATTR_INVERSE: u16 = 1 << 4;
+const ATTR_INVISIBLE: u16 = 1 << 5;
+const ATTR_STRIKETHROUGH: u16 = 1 << 6;
+const ATTR_OVERLINE: u16 = 1 << 7;
+const ATTR_UNDERLINE: u16 = 1 << 8;
 
 fn to_rbox(err: impl std::fmt::Display) -> RBoxError {
     RBoxError::new(std::io::Error::other(err.to_string()))
+}
+
+fn pack_color(color: libghostty_vt::style::RgbColor) -> isize {
+    (((color.r as isize) << 16) | ((color.g as isize) << 8) | (color.b as isize)) as isize
 }
 
 struct Pty {
@@ -75,7 +95,6 @@ impl Pty {
             let mut guard = receiver.lock().await;
 
             let mut buffer: Vec<u8> = Vec::new();
-
             while let Ok(chunk) = guard.try_recv() {
                 buffer.extend_from_slice(&chunk);
             }
@@ -84,10 +103,21 @@ impl Pty {
                 return RResult::ROk(FFIValue::ByteVector(buffer.into()));
             }
 
-            match tokio::time::timeout(std::time::Duration::from_millis(4), guard.recv()).await {
-                Ok(Some(chunk)) => RResult::ROk(FFIValue::ByteVector(chunk.into())),
-                Ok(None) => RResult::ROk(FFIValue::BoolV(false)),
-                Err(_) => RResult::ROk(FFIValue::BoolV(false)),
+            let next = guard.recv();
+            let timeout = futures_time::task::sleep(futures_time::time::Duration::from_millis(4));
+
+            futures::pin_mut!(next);
+
+            match futures::future::select(next, timeout).await {
+                Either::Left((Some(chunk), _)) => {
+                    buffer.extend_from_slice(&chunk);
+                    RResult::ROk(FFIValue::ByteVector(buffer.into()))
+                }
+                Either::Left((None, _)) => RResult::ROk(FFIValue::BoolV(false)),
+                Either::Right((_, pending)) => match pending.await {
+                    Some(chunk) => RResult::ROk(FFIValue::ByteVector(chunk.into())),
+                    None => RResult::ROk(FFIValue::BoolV(false)),
+                },
             }
         }
         .into_ffi()
@@ -175,6 +205,277 @@ fn create_pty_impl(shell: &str, rows: usize, cols: usize) -> Result<Pty> {
     })
 }
 
+#[derive(Clone, Default)]
+struct CellData {
+    text: String,
+    fg: isize,
+    bg: isize,
+    attrs: u16,
+}
+
+struct VTerm {
+    term: Terminal<'static, 'static>,
+    state: RenderState<'static>,
+    cells: Vec<CellData>,
+    rows: u16,
+    cols: u16,
+    cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+    default_fg: isize,
+    default_bg: isize,
+    iter: Option<usize>,
+}
+
+unsafe impl Send for VTerm {}
+unsafe impl Sync for VTerm {}
+
+impl Custom for VTerm {}
+
+impl VTerm {
+    fn new(pty: &Pty, rows: usize, cols: usize) -> Result<Self> {
+        let cols = cols.max(1) as u16;
+        let rows = rows.max(1) as u16;
+
+        let mut term = Terminal::new(cols, rows).context("unable to create terminal")?;
+        term.set_scrollback_max_lines(Some(10000))
+            .context("unable to set scrollback")?;
+        term.set_title("ghosterm").context("unable to set title")?;
+        term.resize(cols, rows, 8, 16)
+            .context("unable to resize terminal")?;
+
+        let writer = Arc::clone(&pty.writer);
+        term.on_pty_write(move |_term, data| {
+            let mut writer = writer.lock();
+            let _ = writer.write_all(data);
+            let _ = writer.flush();
+        })
+        .context("unable to register pty write callback")?;
+
+        let state = RenderState::new().context("unable to create render state")?;
+
+        Ok(Self {
+            term,
+            state,
+            cells: Vec::new(),
+            rows,
+            cols,
+            cursor: None,
+            cursor_visible: false,
+            default_fg: -1,
+            default_bg: -1,
+            iter: None,
+        })
+    }
+
+    fn refresh(&mut self) {
+        let mut new_cells: Vec<CellData> = Vec::new();
+        let mut cursor = None;
+        let mut cursor_visible = false;
+        let mut default_fg = self.default_fg;
+        let mut default_bg = self.default_bg;
+        let mut cols = self.cols;
+
+        {
+            let snapshot = match self.state.update(&self.term) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return,
+            };
+
+            if let Ok(colors) = snapshot.colors() {
+                default_fg = pack_color(colors.foreground);
+                default_bg = pack_color(colors.background);
+            }
+
+            if let Ok(cur) = snapshot.cursor() {
+                cursor_visible = cur.visible;
+                if let Some(viewport) = cur.viewport {
+                    cursor = Some((viewport.x, viewport.y));
+                }
+            }
+
+            if let Ok(snapshot_cols) = snapshot.cols() {
+                if snapshot_cols > 0 {
+                    cols = snapshot_cols;
+                }
+            }
+            let rows = snapshot.rows().unwrap_or(self.rows);
+
+            let Ok(mut row_iterator) = RowIterator::new() else {
+                return;
+            };
+            let Ok(mut cell_iterator) = CellIterator::new() else {
+                return;
+            };
+            let Ok(mut rows_iteration) = row_iterator.update(&snapshot) else {
+                return;
+            };
+
+            while let Some(row) = rows_iteration.next() {
+                let mut in_row = 0u16;
+                {
+                    if let Ok(mut cells) = cell_iterator.update(row) {
+                        while let Some(cell) = cells.next() {
+                            let mut text = String::new();
+                            let _ = cell.graphemes_utf8(&mut text);
+
+                            let fg = cell.fg_color().ok().flatten().map(pack_color).unwrap_or(-1);
+                            let bg = cell.bg_color().ok().flatten().map(pack_color).unwrap_or(-1);
+
+                            let mut attrs = 0u16;
+                            if let Ok(style) = cell.style() {
+                                if style.bold {
+                                    attrs |= ATTR_BOLD;
+                                }
+                                if style.italic {
+                                    attrs |= ATTR_ITALIC;
+                                }
+                                if style.faint {
+                                    attrs |= ATTR_FAINT;
+                                }
+                                if style.blink {
+                                    attrs |= ATTR_BLINK;
+                                }
+                                if style.inverse {
+                                    attrs |= ATTR_INVERSE;
+                                }
+                                if style.invisible {
+                                    attrs |= ATTR_INVISIBLE;
+                                }
+                                if style.strikethrough {
+                                    attrs |= ATTR_STRIKETHROUGH;
+                                }
+                                if style.overline {
+                                    attrs |= ATTR_OVERLINE;
+                                }
+                                if !matches!(style.underline, Underline::None) {
+                                    attrs |= ATTR_UNDERLINE;
+                                }
+                            }
+
+                            new_cells.push(CellData {
+                                text,
+                                fg,
+                                bg,
+                                attrs,
+                            });
+                            in_row += 1;
+                        }
+                    }
+                }
+
+                while in_row < cols {
+                    new_cells.push(CellData::default());
+                    in_row += 1;
+                }
+            }
+
+            let _ = rows;
+        }
+
+        self.default_fg = default_fg;
+        self.default_bg = default_bg;
+        self.cols = cols;
+        self.cursor = cursor;
+        self.cursor_visible = cursor_visible;
+        self.cells = new_cells;
+        self.iter = None;
+    }
+
+    fn advance_bytes(&mut self, data: RVec<u8>) -> bool {
+        self.term.vt_write(&data);
+        true
+    }
+
+    fn resize(&mut self, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
+        let cols = cols.max(1) as u16;
+        let rows = rows.max(1) as u16;
+        match self.term.resize(cols, rows, 8, 16) {
+            Ok(()) => {
+                self.cols = cols;
+                self.rows = rows;
+                self.refresh();
+                RResult::ROk(FFIValue::Void)
+            }
+            Err(err) => RResult::RErr(to_rbox(err)),
+        }
+    }
+
+    fn reset_iterator(&mut self) {
+        self.refresh();
+        self.iter = None;
+    }
+
+    fn advance_iterator(&mut self) -> bool {
+        let next = match self.iter {
+            None => 0,
+            Some(index) => index + 1,
+        };
+
+        if next < self.cells.len() {
+            self.iter = Some(next);
+            true
+        } else {
+            self.iter = Some(next);
+            false
+        }
+    }
+
+    fn iter_x(&self) -> isize {
+        match self.iter {
+            Some(index) if self.cols > 0 => (index % self.cols as usize) as isize,
+            _ => -1,
+        }
+    }
+
+    fn iter_y(&self) -> isize {
+        match self.iter {
+            Some(index) if self.cols > 0 => (index / self.cols as usize) as isize,
+            _ => -1,
+        }
+    }
+
+    fn iter_cell_str(&self) -> String {
+        self.current()
+            .map(|cell| cell.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn iter_cell_fg(&self) -> isize {
+        self.current().map(|cell| cell.fg).unwrap_or(-1)
+    }
+
+    fn iter_cell_bg(&self) -> isize {
+        self.current().map(|cell| cell.bg).unwrap_or(-1)
+    }
+
+    fn iter_cell_attrs(&self) -> isize {
+        self.current().map(|cell| cell.attrs as isize).unwrap_or(0)
+    }
+
+    fn current(&self) -> Option<&CellData> {
+        self.iter.and_then(|index| self.cells.get(index))
+    }
+
+    fn cursor_x(&self) -> isize {
+        self.cursor.map(|(x, _)| x as isize).unwrap_or(-1)
+    }
+
+    fn cursor_y(&self) -> isize {
+        self.cursor.map(|(_, y)| y as isize).unwrap_or(-1)
+    }
+
+    fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+}
+
+fn virtual_terminal(pty: &Pty, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
+    match VTerm::new(pty, rows, cols) {
+        Ok(vterm) => RResult::ROk(vterm.into_ffi_val().expect("VTerm is always convertible")),
+        Err(err) => RResult::RErr(to_rbox(err)),
+    }
+}
+
 declare_module!(create_module);
 
 fn create_module() -> FFIModule {
@@ -184,10 +485,25 @@ fn create_module() -> FFIModule {
         .register_fn("default-shell", default_shell)
         .register_fn("create-pty", create_pty)
         .register_fn("pty-write", Pty::send_command)
+        .register_fn("pty-write-char", Pty::send_command_char)
         .register_fn("pty-resize", Pty::resize)
         .register_fn("pty-kill", Pty::kill)
         .register_fn("pty-alive?", Pty::alive)
-        .register_fn("pty-read", Pty::async_read);
+        .register_fn("pty-read", Pty::async_read)
+        .register_fn("virtual-terminal", virtual_terminal)
+        .register_fn("vte/advance-bytes", VTerm::advance_bytes)
+        .register_fn("vte/resize", VTerm::resize)
+        .register_fn("vte/reset-iterator!", VTerm::reset_iterator)
+        .register_fn("vte/advance-iterator!", VTerm::advance_iterator)
+        .register_fn("vte/iter-x", VTerm::iter_x)
+        .register_fn("vte/iter-y", VTerm::iter_y)
+        .register_fn("vte/iter-cell-str", VTerm::iter_cell_str)
+        .register_fn("vte/iter-cell-fg", VTerm::iter_cell_fg)
+        .register_fn("vte/iter-cell-bg", VTerm::iter_cell_bg)
+        .register_fn("vte/iter-cell-attrs", VTerm::iter_cell_attrs)
+        .register_fn("vte/cursor-x", VTerm::cursor_x)
+        .register_fn("vte/cursor-y", VTerm::cursor_y)
+        .register_fn("vte/cursor-visible?", VTerm::cursor_visible);
 
     module
 }

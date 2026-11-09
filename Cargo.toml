@@ -3,6 +3,10 @@ name = "ghosterm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "ghosterm"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "3a418c9ea586c1862a8c3a49d6a998436afc8957", features = [
     "anyhow",
@@ -18,3 +22,4 @@ futures = "0.3"
 futures-time = "3"
 tokio = { version = "1", features = ["sync", "time"] }
 parking_lot = "0.13"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "768add93c54ccdba3f5c4d8763789ab6416f3151" }
