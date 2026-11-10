@@ -35,8 +35,9 @@
                           vte/scroll-bottom))
 
 (provide terminal
-         terminal-toggle
-         terminal-run)
+         terminal-exec
+         terminal-run
+         terminal-toggle)
 
 (define *terminal* #f)
 (define *terminal-shell* (default-shell))
@@ -51,7 +52,11 @@
         (max 1 (quotient (area-height area) 2))
         24)))
 
-(define (terminal) (show-terminal))
+(define (terminal . args)
+  (if (null? args)
+    (show-terminal))
+    (terminal-exec-in (terminal-exec-command args)))
+
 (define (terminal-toggle) (toggle-terminal))
 
 (define (show-terminal)
@@ -428,10 +433,14 @@
 (define (terminal-run)
   (let ([command (run-command "run")])
     (when command
-      (unless (and *terminal*
-                   (terminal-loop-alive? *terminal*))
-        (show-terminal))
+      (terminal-exec command))))
 
+(define (terminal-exec . args)
+  (define command (terminal-exec-command args))
+  (if (string=? command "")
+    (set-status! "terminal-exec: missing command")
+    (begin
+      (show-terminal)
       (let ([term *terminal*])
         (when term
           (pty-write
@@ -440,6 +449,9 @@
 
           (set-box! (Terminal-focused? term) #t)
           (helix.redraw))))))
+
+(define (terminal-exec-command args)
+  (string-join args " "))
 
 (define (mouse-inside-terminal? state event)
   (define pane (unbox (Terminal-area state)))
