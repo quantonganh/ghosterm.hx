@@ -28,7 +28,11 @@
                           vte/iter-cell-attrs
                           vte/cursor-x
                           vte/cursor-y
-                          vte/cursor-visible?))
+                          vte/cursor-visible?
+                          vte/scroll-up
+                          vte/scroll-down
+                          vte/scroll-top
+                          vte/scroll-bottom))
 
 (provide terminal
          terminal-toggle
@@ -90,7 +94,7 @@
 
 (struct Terminal
         (name cursor pty vte size focused? active pushed? kill-switch area
-              renderer event-handler cursor-handler))
+              cursor-shown? renderer event-handler cursor-handler))
 
 (define (make-terminal shell rows cols)
   (define pty (create-pty shell rows cols))
@@ -99,6 +103,7 @@
             (position 0 0)
             pty
             vt
+            (box #f)
             (box #f)
             (box #f)
             (box #f)
@@ -196,9 +201,22 @@
        (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
 
      (define cursor (Terminal-cursor state))
-     (when (and focused (vte/cursor-visible? vt))
-       (set-position-row! cursor (+ y-offset (vte/cursor-y vt)))
-       (set-position-col! cursor (+ x-offset (vte/cursor-x vt))))]))
+     (define cursor-y (vte/cursor-y vt))
+     (define cursor-x (vte/cursor-x vt))
+     ;; After scrolling the viewport the terminal cursor can be outside the
+     ;; visible rows, in which case its coordinates are negative. Passing
+     ;; those through would wrap to 65535 and panic the terminal backend.
+     (define cursor-shown?
+       (and focused
+            (vte/cursor-visible? vt)
+            (>= cursor-y 0)
+            (< cursor-y text-rows)
+            (>= cursor-x 0)
+            (< cursor-x cols)))
+     (set-box! (Terminal-cursor-shown? state) cursor-shown?)
+     (when cursor-shown?
+       (set-position-row! cursor (+ y-offset cursor-y))
+       (set-position-col! cursor (+ x-offset cursor-x)))]))
 
 (define (render-current-cell vt frame x-offset y-offset theme-fg theme-bg)
   (define text (vte/iter-cell-str vt))
@@ -259,6 +277,9 @@
     [(not (unbox (Terminal-active state)))
      event-result/ignore]
 
+    [(mouse-event? event)
+     (handle-mouse-event state event)]
+
     [(not (unbox (Terminal-focused? state)))
      event-result/ignore]
 
@@ -281,7 +302,8 @@
 
 (define (terminal-cursor-handler state _rect)
   (if (and (unbox (Terminal-active state))
-           (unbox (Terminal-focused? state)))
+           (unbox (Terminal-focused? state))
+           (unbox (Terminal-cursor-shown? state)))
       (Terminal-cursor state)
       #f))
 
@@ -411,3 +433,18 @@
 
           (set-box! (Terminal-focused? term) #t)
           (helix.redraw))))))
+
+(define (handle-mouse-event state event)
+  (define kind (event-mouse-kind event))
+  (cond
+    [(unbox (Terminal-kill-switch state))
+     event-result/ignore]
+
+    [else
+     (focus-terminal!)
+     (cond
+       [(= kind 10) (vte/scroll-down (Terminal-vte state) 3)]
+       [(= kind 11) (vte/scroll-up (Terminal-vte state) 3)]
+       [else void])
+     (helix.redraw)
+     event-result/consume]))

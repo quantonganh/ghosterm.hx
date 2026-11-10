@@ -7,7 +7,7 @@ use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::Underline;
-use libghostty_vt::terminal::Terminal;
+use libghostty_vt::terminal::{ScrollViewport, Terminal};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use steel::declare_module;
 use steel::rvals::Custom;
@@ -467,6 +467,28 @@ impl VTerm {
     fn cursor_visible(&self) -> bool {
         self.cursor_visible
     }
+
+    fn scroll_up(&mut self, amount: isize) {
+        self.term
+            .scroll_viewport(ScrollViewport::Delta(-amount.max(0)));
+        self.refresh();
+    }
+
+    fn scroll_down(&mut self, amount: isize) {
+        self.term
+            .scroll_viewport(ScrollViewport::Delta(amount.max(0)));
+        self.refresh();
+    }
+
+    fn scroll_top(&mut self) {
+        self.term.scroll_viewport(ScrollViewport::Top);
+        self.refresh();
+    }
+
+    fn scroll_bottom(&mut self) {
+        self.term.scroll_viewport(ScrollViewport::Bottom);
+        self.refresh();
+    }
 }
 
 fn virtual_terminal(pty: &Pty, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
@@ -503,7 +525,11 @@ fn create_module() -> FFIModule {
         .register_fn("vte/iter-cell-attrs", VTerm::iter_cell_attrs)
         .register_fn("vte/cursor-x", VTerm::cursor_x)
         .register_fn("vte/cursor-y", VTerm::cursor_y)
-        .register_fn("vte/cursor-visible?", VTerm::cursor_visible);
+        .register_fn("vte/cursor-visible?", VTerm::cursor_visible)
+        .register_fn("vte/scroll-up", VTerm::scroll_up)
+        .register_fn("vte/scroll-down", VTerm::scroll_down)
+        .register_fn("vte/scroll-top", VTerm::scroll_top)
+        .register_fn("vte/scroll-bottom", VTerm::scroll_bottom);
 
     module
 }
