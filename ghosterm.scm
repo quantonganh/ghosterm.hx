@@ -1,8 +1,10 @@
+(require "helix/editor.scm")
 (require "helix/configuration.scm")
 (require "helix/misc.scm")
 (require "helix/components.scm")
 (require (prefix-in helix. "helix/commands.scm"))
 (require "helix/editor.scm")
+(require "run.scm")
 
 (#%require-dylib "libghosterm"
                  (only-in default-shell
@@ -29,7 +31,8 @@
                           vte/cursor-visible?))
 
 (provide terminal
-         terminal-toggle)
+         terminal-toggle
+         terminal-run)
 
 (define *terminal* #f)
 (define *terminal-shell* (default-shell))
@@ -37,10 +40,17 @@
 ;; Number of text rows the bottom pane occupies (the top border is extra).
 (define *terminal-height* 24)
 
+(define (update-terminal-height!)
+  (let ([area (editor-focused-buffer-area)])
+    (when area
+      (set! *terminal-height*
+        (max 1 (quotient (area-height area) 2))))))
+
 (define (terminal) (show-terminal))
 (define (terminal-toggle) (toggle-terminal))
 
 (define (show-terminal)
+  (update-terminal-height!)
   (unless (terminal-loop-alive? *terminal*)
     (when (and *terminal*
                (unbox (Terminal-pushed? *terminal*)))
@@ -385,3 +395,19 @@
     (set-box! (Terminal-active term) #f)
     (set-editor-clip-bottom! 0)
     (helix.redraw))
+
+(define (terminal-run)
+  (let ([command (run-command "run")])
+    (when command
+      (unless (and *terminal*
+                   (terminal-loop-alive? *terminal*))
+        (show-terminal))
+
+      (let ([term *terminal*])
+        (when term
+          (pty-write
+            (Terminal-pty term)
+            (string-append command "\r"))
+
+          (set-box! (Terminal-focused? term) #t)
+          (helix.redraw))))))
