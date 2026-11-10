@@ -1,0 +1,387 @@
+(require "helix/configuration.scm")
+(require "helix/misc.scm")
+(require "helix/components.scm")
+(require (prefix-in helix. "helix/commands.scm"))
+(require "helix/editor.scm")
+
+(#%require-dylib "libghosterm"
+                 (only-in default-shell
+                          create-pty
+                          pty-write
+                          pty-write-char
+                          pty-resize
+                          pty-kill
+                          pty-alive?
+                          pty-read
+                          virtual-terminal
+                          vte/advance-bytes
+                          vte/resize
+                          vte/reset-iterator!
+                          vte/advance-iterator!
+                          vte/iter-x
+                          vte/iter-y
+                          vte/iter-cell-str
+                          vte/iter-cell-fg
+                          vte/iter-cell-bg
+                          vte/iter-cell-attrs
+                          vte/cursor-x
+                          vte/cursor-y
+                          vte/cursor-visible?))
+
+(provide terminal)
+
+(define *terminal* #f)
+(define *terminal-shell* (default-shell))
+
+;; Number of text rows the bottom pane occupies (the top border is extra).
+(define *terminal-height* 24)
+
+(define (terminal) (show-terminal!))
+
+(define (show-terminal!)
+  (unless (terminal-loop-alive? *terminal*)
+    (when (and *terminal*
+               (unbox (Terminal-pushed? *terminal*)))
+      (pop-last-component! "ghosterm"))
+
+    (set! *terminal*
+          (make-terminal *terminal-shell* *terminal-height* 80))
+
+    (terminal-loop *terminal*))
+
+  (define term *terminal*)
+
+  (set-box! (Terminal-active term) #t)
+  (set-box! (Terminal-focused? term) #t)
+
+  (unless (unbox (Terminal-pushed? term))
+    (set-box! (Terminal-pushed? term) #t)
+    (push-component!
+     (new-component! "ghosterm"
+                     term
+                     (Terminal-renderer term)
+                     (component-functions term))))
+
+  (helix.redraw))
+
+(define (component-functions term)
+    (define with-handle
+        (hash-insert (hash) "handle_event" (Terminal-event-handler term)))
+    (hash-insert with-handle "cursor" (Terminal-cursor-handler term)))
+
+(define (terminal-loop-alive? term)
+  (and term (not (unbox (Terminal-kill-switch term)))))
+
+(define (focus-terminal!)
+  (when *terminal*
+    (set-box! (Terminal-focused? *terminal*) #t)))
+
+(struct Terminal
+        (name cursor pty vte size focused? active pushed? kill-switch area
+              renderer event-handler cursor-handler))
+
+(define (make-terminal shell rows cols)
+  (define pty (create-pty shell rows cols))
+  (define vt (virtual-terminal pty rows cols))
+  (Terminal "ghosterm"
+            (position 0 0)
+            pty
+            vt
+            (box #f)
+            (box #f)
+            (box #f)
+            (box #f)
+            (box #f)
+            (box #f)
+            terminal-render
+            terminal-event-handler
+            terminal-cursor-handler))
+
+(define (terminal-loop term)
+  (define pty (Terminal-pty term))
+  (define vt (Terminal-vte term))
+  (define kill-switch (Terminal-kill-switch term))
+  (if (unbox kill-switch)
+      void
+      (helix-await-callback
+       (pty-read pty)
+       (lambda (bytes)
+         (cond
+           [bytes
+            (vte/advance-bytes vt bytes)
+            (terminal-loop term)]
+           [(pty-alive? pty)
+            (terminal-loop term)]
+           [else
+            ;; Keep the final screen visible; the next show command will
+            ;; replace this component with a fresh shell.
+            (set-box! kill-switch #t)
+            (set-box! (Terminal-focused? term) #f)
+            (helix.redraw)])))))
+
+(define (terminal-render state rect frame)
+  (when state
+    (if (unbox (Terminal-active state))
+        (render-bottom-terminal state rect frame)
+        (set-editor-clip-bottom! 0))))
+
+(define (render-bottom-terminal state rect frame)
+  (define pane (terminal-pane-area rect))
+
+  (cond
+    [(not pane)
+     ;; Not enough room to reserve a safe editor area.
+     (set-editor-clip-bottom! 0)]
+
+    [else
+     (define vt (Terminal-vte state))
+     (define pty (Terminal-pty state))
+     (define focused (unbox (Terminal-focused? state)))
+
+     (define text-rows (max 1 (- (area-height pane) 1)))
+     (define cols (max 1 (area-width pane)))
+
+     ;; Reserve the bottom pane.
+     (set-editor-clip-bottom! (- (area-height pane) 1))
+     (set-box! (Terminal-area state) pane)
+
+     ;; Resize only when dimensions change.
+     (define target-size (list text-rows cols))
+     (unless (equal? (unbox (Terminal-size state)) target-size)
+       (set-box! (Terminal-size state) target-size)
+       (vte/resize vt text-rows cols)
+       (pty-resize pty text-rows cols))
+
+     (define theme-fg
+       (or (style->fg (theme->fg *helix.cx*)) Color/White))
+     (define theme-bg
+       (or (style->bg (theme->bg *helix.cx*)) Color/Black))
+     (define border-fg theme-fg)
+     (define border-base (style-fg (theme->bg *helix.cx*) border-fg))
+     (define border-style
+       (if focused border-base (style-with-dim border-base)))
+
+     (buffer/clear frame pane)
+     (block/render frame
+                   pane
+                   (make-block (theme->bg *helix.cx*)
+                               border-style
+                               "top"
+                               "plain"))
+
+     (when (> (area-width pane) 16)
+       (frame-set-string! frame
+                          (+ (area-x pane) 2)
+                          (area-y pane)
+                          " terminal "
+                          border-style))
+
+     (define x-offset (area-x pane))
+     (define y-offset (+ (area-y pane) 1))
+
+     (vte/reset-iterator! vt)
+     (while (vte/advance-iterator! vt)
+       (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
+
+     (define cursor (Terminal-cursor state))
+     (when (and focused (vte/cursor-visible? vt))
+       (set-position-row! cursor (+ y-offset (vte/cursor-y vt)))
+       (set-position-col! cursor (+ x-offset (vte/cursor-x vt))))]))
+
+(define (render-current-cell vt frame x-offset y-offset theme-fg theme-bg)
+  (define text (vte/iter-cell-str vt))
+  (unless (string=? text "")
+    (frame-set-string! frame
+                       (+ x-offset (vte/iter-x vt))
+                       (+ y-offset (vte/iter-y vt))
+                       text
+                       (cell-style (vte/iter-cell-fg vt)
+                                   (vte/iter-cell-bg vt)
+                                   (vte/iter-cell-attrs vt)
+                                   theme-fg
+                                   theme-bg))))
+
+(define (cell-style fg bg attrs theme-fg theme-bg)
+  (define inverse? (ghost-bit? attrs 4))
+  (define actual-fg (if (< fg 0) theme-fg (unpack-color fg)))
+  (define actual-bg (if (< bg 0) theme-bg (unpack-color bg)))
+
+  (define base (style))
+  (set-style-fg! base (if inverse? actual-bg actual-fg))
+  (set-style-bg! base (if inverse? actual-fg actual-bg))
+
+  (define bold-style (if (ghost-bit? attrs 0) (style-with-bold base) base))
+  (define italic-style
+    (if (ghost-bit? attrs 1) (style-with-italics bold-style) bold-style))
+  (define faint-style
+    (if (ghost-bit? attrs 2) (style-with-dim italic-style) italic-style))
+  (define crossed-style
+    (if (ghost-bit? attrs 6)
+        (style-with-crossed-out faint-style)
+        faint-style))
+  (if (ghost-bit? attrs 8)
+      (style-underline-style crossed-style Underline/Line)
+      crossed-style))
+
+(define (ghost-bit? value bit)
+  (odd? (quotient value (expt 2 bit))))
+
+(define (unpack-color value)
+  (Color/rgb (quotient value 65536)
+             (quotient (modulo value 65536) 256)
+             (modulo value 256)))
+
+(define (terminal-pane-area rect)
+  (define total (area-height rect))
+  (define max-rows (max 0 (- total 5)))
+  (if (< max-rows 1)
+      #f
+      (begin
+        (define rows (min (max 1 *terminal-height*) max-rows))
+        (define pane-height (+ rows 1))
+        (define y (- total pane-height))
+        (area (area-x rect) y (area-width rect) pane-height))))
+
+(define (terminal-event-handler state event)
+  (cond
+    [(not (unbox (Terminal-active state)))
+     event-result/ignore]
+
+    [(not (unbox (Terminal-focused? state)))
+     event-result/ignore]
+
+    ;; Ctrl+T: return focus to editor.
+    [(and (key-event? event)
+          (key-event-char event)
+          (char=? (key-event-char event) #\t)
+          (ghost-bit? (or (key-event-modifier event) 0) 1))
+     (set-box! (Terminal-focused? state) #f)
+     (helix.redraw)
+     event-result/consume]
+
+    [(key-event? event)
+     (handle-key-event state event)
+     event-result/consume]
+
+    [(paste-event? event)
+     (pty-write (Terminal-pty state) (paste-event-string event))
+     event-result/consume]
+
+    [else event-result/ignore]))
+
+(define (terminal-cursor-handler state _rect)
+  (if (and (unbox (Terminal-active state))
+           (unbox (Terminal-focused? state)))
+      (Terminal-cursor state)
+      #f))
+
+(define (handle-key-event state event)
+  (define pty (Terminal-pty state))
+  (define mods (or (key-event-modifier event) 0))
+  (define c (key-event-char event))
+
+  (cond
+    [(key-event-backspace? event) (pty-write-char pty (integer->char 127))]
+    [(key-event-enter? event) (pty-write pty "\r")]
+    [(key-event-tab? event)
+     (if (ghost-bit? mods 0)
+         (pty-write pty "\x1b;[Z")
+         (pty-write-char pty (integer->char 9)))]
+    [(key-event-escape? event) (pty-write-char pty (integer->char 27))]
+    [(key-event-up? event) (send-csi pty "A" mods)]
+    [(key-event-down? event) (send-csi pty "B" mods)]
+    [(key-event-right? event) (send-csi pty "C" mods)]
+    [(key-event-left? event) (send-csi pty "D" mods)]
+    [(key-event-home? event) (send-csi pty "H" mods)]
+    [(key-event-end? event) (send-csi pty "F" mods)]
+    [(key-event-page-up? event) (send-tilde pty "5" mods)]
+    [(key-event-page-down? event) (send-tilde pty "6" mods)]
+    [(key-event-insert? event) (send-tilde pty "2" mods)]
+    [(key-event-delete? event) (send-tilde pty "3" mods)]
+    [(key-event-F? event 1) (send-function-key pty 1)]
+    [(key-event-F? event 2) (send-function-key pty 2)]
+    [(key-event-F? event 3) (send-function-key pty 3)]
+    [(key-event-F? event 4) (send-function-key pty 4)]
+    [(key-event-F? event 5) (send-function-key pty 5)]
+    [(key-event-F? event 6) (send-function-key pty 6)]
+    [(key-event-F? event 7) (send-function-key pty 7)]
+    [(key-event-F? event 8) (send-function-key pty 8)]
+    [(key-event-F? event 9) (send-function-key pty 9)]
+    [(key-event-F? event 10) (send-function-key pty 10)]
+    [(key-event-F? event 11) (send-function-key pty 11)]
+    [(key-event-F? event 12) (send-function-key pty 12)]
+    [else (if c (send-character pty c mods) void)]))
+
+(define (send-csi pty final mods)
+  (if (= mods 0)
+      (pty-write pty (string-append "\x1b;[" final))
+      (pty-write pty
+                 (string-append "\x1b;[1;"
+                                (number->string (xterm-modifier mods))
+                                final))))
+
+(define (send-tilde pty code mods)
+  (if (= mods 0)
+      (pty-write pty (string-append "\x1b;[" code "~"))
+      (pty-write pty
+                 (string-append "\x1b;["
+                                code
+                                ";"
+                                (number->string (xterm-modifier mods))
+                                "~"))))
+
+(define (send-function-key pty number)
+  (define sequence
+    (cond
+      [(= number 1) "\x1b;OP"]
+      [(= number 2) "\x1b;OQ"]
+      [(= number 3) "\x1b;OR"]
+      [(= number 4) "\x1b;OS"]
+      [(= number 5) "\x1b;[15~"]
+      [(= number 6) "\x1b;[17~"]
+      [(= number 7) "\x1b;[18~"]
+      [(= number 8) "\x1b;[19~"]
+      [(= number 9) "\x1b;[20~"]
+      [(= number 10) "\x1b;[21~"]
+      [(= number 11) "\x1b;[23~"]
+      [(= number 12) "\x1b;[24~"]
+      [else #f]))
+  (when sequence (pty-write pty sequence)))
+
+(define (send-character pty c mods)
+  (define alt? (ghost-bit? mods 2))
+  (define ctrl? (ghost-bit? mods 1))
+  (define control (if ctrl? (ctrl-char c) #f))
+  (when alt? (pty-write-char pty (integer->char 27)))
+  (cond
+    [control (pty-write-char pty control)]
+    [else (pty-write-char pty c)]))
+
+(define (ctrl-char c)
+  (define code (char->integer c))
+  (cond
+    [(and (>= code 65) (<= code 90)) (integer->char (- code 64))]
+    [(and (>= code 97) (<= code 122)) (integer->char (- code 96))]
+    [(= code 32) (integer->char 0)]
+    [(= code 63) (integer->char 127)]
+    [else #f]))
+
+(define (xterm-modifier mods)
+    (+ 1
+        (if (ghost-bit? mods 0) 1 0)
+        (if (ghost-bit? mods 2) 2 0)
+        (if (ghost-bit? mods 1) 4 0)
+        (if (ghost-bit? mods 3) 8 0)))
+
+(define (toggle-terminal)
+    (define term *terminal*)
+    (if (and term (unbox (Terminal-active term)))
+        (hide-terminal)
+        (show-terminal)))
+
+(define (hide-terminal)
+    (define term *terminal*)
+    (set-box! (Terminal-focused? term) #f)
+    (set-box! (Terminal-active term) #f)
+    (set-editor-clip-bottom! 0)
+    (helix.redraw))
