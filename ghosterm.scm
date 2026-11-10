@@ -28,7 +28,8 @@
                           vte/cursor-y
                           vte/cursor-visible?))
 
-(provide terminal)
+(provide terminal
+         terminal-toggle)
 
 (define *terminal* #f)
 (define *terminal-shell* (default-shell))
@@ -36,9 +37,10 @@
 ;; Number of text rows the bottom pane occupies (the top border is extra).
 (define *terminal-height* 24)
 
-(define (terminal) (show-terminal!))
+(define (terminal) (show-terminal))
+(define (terminal-toggle) (toggle-terminal))
 
-(define (show-terminal!)
+(define (show-terminal)
   (unless (terminal-loop-alive? *terminal*)
     (when (and *terminal*
                (unbox (Terminal-pushed? *terminal*)))
@@ -250,11 +252,9 @@
     [(not (unbox (Terminal-focused? state)))
      event-result/ignore]
 
-    ;; Ctrl+T: return focus to editor.
+    ;; Esc: return focus to editor.
     [(and (key-event? event)
-          (key-event-char event)
-          (char=? (key-event-char event) #\t)
-          (ghost-bit? (or (key-event-modifier event) 0) 1))
+          (key-event-escape? event))
      (set-box! (Terminal-focused? state) #f)
      (helix.redraw)
      event-result/consume]
