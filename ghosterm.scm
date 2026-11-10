@@ -42,26 +42,28 @@
 (define *terminal-shell* (default-shell))
 
 ;; Number of text rows the bottom pane occupies (the top border is extra).
-(define *terminal-height* 24)
+;; #f means "half of the current editor height", recomputed on every render.
+(define *terminal-height* #f)
 
-(define (update-terminal-height!)
+(define (default-terminal-height)
   (let ([area (editor-focused-buffer-area)])
-    (when area
-      (set! *terminal-height*
-        (max 1 (quotient (area-height area) 2))))))
+    (if area
+        (max 1 (quotient (area-height area) 2))
+        24)))
 
 (define (terminal) (show-terminal))
 (define (terminal-toggle) (toggle-terminal))
 
 (define (show-terminal)
-  (update-terminal-height!)
   (unless (terminal-loop-alive? *terminal*)
     (when (and *terminal*
                (unbox (Terminal-pushed? *terminal*)))
       (pop-last-component! "ghosterm"))
 
     (set! *terminal*
-          (make-terminal *terminal-shell* *terminal-height* 80))
+          (make-terminal *terminal-shell*
+                         (or *terminal-height* (default-terminal-height))
+                         80))
 
     (terminal-loop *terminal*))
 
@@ -267,7 +269,12 @@
   (if (< max-rows 1)
       #f
       (begin
-        (define rows (min (max 1 *terminal-height*) max-rows))
+        (define rows
+          (if *terminal-height*
+              (min (max 1 *terminal-height*) max-rows)
+              ;; Split the rows left after the statusline and pane border
+              ;; evenly between the editor and the terminal.
+              (min (max 1 (quotient (- total 2) 2)) max-rows)))
         (define pane-height (+ rows 1))
         (define y (- total pane-height))
         (area (area-x rect) y (area-width rect) pane-height))))
