@@ -441,17 +441,158 @@
           (set-box! (Terminal-focused? term) #t)
           (helix.redraw))))))
 
+(define (mouse-inside-terminal? state event)
+  (define pane (unbox (Terminal-area state)))
+  (and pane
+       (>= (event-mouse-col event) (area-x pane))
+       (< (event-mouse-col event) (+ (area-x pane) (area-width pane)))
+       (>= (event-mouse-row event) (area-y pane))
+       (< (event-mouse-row event) (+ (area-y pane) (area-height pane)))))
+
 (define (handle-mouse-event state event)
   (define kind (event-mouse-kind event))
   (cond
     [(unbox (Terminal-kill-switch state))
      event-result/ignore]
 
+    ;; Clicks outside the pane belong to the editor. If the terminal had
+    ;; focus, let go of it so the editor receives keys again.
+    [(not (mouse-inside-terminal? state event))
+     (when (unbox (Terminal-focused? state))
+       (set-box! (Terminal-focused? state) #f)
+       (helix.redraw))
+     event-result/ignore]
+
     [else
-     (focus-terminal!)
+     ;; Focus on presses and wheel events, but not on releases: the release
+     ;; that follows opening a path must not steal focus back from the editor.
+     (when (or (<= kind 2) (= kind 10) (= kind 11))
+       (focus-terminal!))
      (cond
        [(= kind 10) (vte/scroll-down (Terminal-vte state) 3)]
        [(= kind 11) (vte/scroll-up (Terminal-vte state) 3)]
+       [(= kind 0) (open-path-at-click state event)]
        [else void])
      (helix.redraw)
      event-result/consume]))
+
+;; Reconstruct the visible text of one terminal row. Cells are one column
+;; wide, so pad blanks with spaces to keep the click column aligned.
+(define (terminal-row-text vt target-row cols)
+  (define cells (make-vector cols " "))
+  (vte/reset-iterator! vt)
+  (while (vte/advance-iterator! vt)
+    (when (and (= (vte/iter-y vt) target-row)
+               (>= (vte/iter-x vt) 0)
+               (< (vte/iter-x vt) cols))
+      (let ([text (vte/iter-cell-str vt)])
+        (unless (string=? text "")
+          (vector-set! cells (vte/iter-x vt) text)))))
+  (string-join (mutable-vector->list cells) ""))
+
+(define (token-under-click line x)
+  (define n (string-length line))
+  (if (or (>= x n) (char-whitespace? (string-ref line x)))
+      #f
+      (begin
+        (define start x)
+        (while (and (> start 0)
+                    (not (char-whitespace? (string-ref line (- start 1)))))
+          (set! start (- start 1)))
+        (define end x)
+        (while (and (< end n)
+                    (not (char-whitespace? (string-ref line end))))
+          (set! end (+ end 1)))
+        (substring line start end))))
+
+(define (strip-token text)
+  (define start 0)
+  (define end (string-length text))
+  (while (and (< start end) (leading-delimiter? (string-ref text start)))
+    (set! start (+ start 1)))
+  (while (and (> end start) (trailing-delimiter? (string-ref text (- end 1))))
+    (set! end (- end 1)))
+  (substring text start end))
+
+(define (leading-delimiter? c)
+  (or (char=? c #\() (char=? c #\[) (char=? c #\{)
+      (char=? c #\<) (char=? c #\") (char=? c #\')
+      (char=? c #\`)))
+
+(define (trailing-delimiter? c)
+  (or (char=? c #\)) (char=? c #\]) (char=? c #\})
+      (char=? c #\>) (char=? c #\") (char=? c #\')
+      (char=? c #\`) (char=? c #\,) (char=? c #\;)))
+
+(define (colon-parts text)
+  (define parts '())
+  (define start 0)
+  (define i 0)
+  (while (< i (string-length text))
+    (when (char=? (string-ref text i) #\:)
+      (set! parts (cons (substring text start i) parts))
+      (set! start (+ i 1)))
+    (set! i (+ i 1)))
+  (reverse (cons (substring text start (string-length text)) parts)))
+
+(define (digits-only? text)
+  (define ok (> (string-length text) 0))
+  (define i 0)
+  (while (< i (string-length text))
+    (define code (char->integer (string-ref text i)))
+    (when (or (< code 48) (> code 57))
+      (set! ok #f))
+    (set! i (+ i 1)))
+  ok)
+
+(define (plausible-path? path)
+  (and (> (string-length path) 0)
+       (or (string-contains? path "/")
+           (string-contains? path "\\")
+           (string-contains? path "."))))
+
+;; Turn a token like src/main.rs:10:5 into the same location string that
+;; Helix's :open command understands. Trailing colons/commas are ignored.
+(define (location-at-token token)
+  (define cleaned (strip-token token))
+  (if (string=? cleaned "")
+      #f
+      (let ([rev (reverse (colon-parts cleaned))])
+        (while (and (not (null? rev)) (string=? (car rev) ""))
+          (set! rev (cdr rev)))
+        (if (or (null? rev) (null? (cdr rev)))
+            #f
+            (let ([last (car rev)]
+                  [rest (cdr rev)])
+              (if (not (digits-only? last))
+                  #f
+                  (let ([prev (car rest)])
+                    (if (digits-only? prev)
+                        (let ([path (string-join (reverse (cdr rest)) ":")])
+                          (if (plausible-path? path)
+                              (string-append path ":" prev ":" last)
+                              #f))
+                        (let ([path (string-join (reverse rest) ":")])
+                          (if (plausible-path? path)
+                              (string-append path ":" last)
+                              #f))))))))))
+
+;; Left-click a path:line:col shown in the terminal and open it in the
+;; editor. The terminal stays visible, but focus returns to the editor.
+(define (open-path-at-click state event)
+  (define pane (unbox (Terminal-area state)))
+  (define size (unbox (Terminal-size state)))
+  (when (and pane size)
+    (define rows (car size))
+    (define cols (car (cdr size)))
+    (define cell-x (- (event-mouse-col event) (area-x pane)))
+    (define cell-y (- (event-mouse-row event) (+ (area-y pane) 1)))
+    (when (and (>= cell-x 0) (< cell-x cols)
+               (>= cell-y 0) (< cell-y rows))
+      (let* ([line (terminal-row-text (Terminal-vte state) cell-y cols)]
+             [token (token-under-click line cell-x)])
+        (when token
+          (let ([location (location-at-token token)])
+            (when location
+              (helix.open location)
+              (set-box! (Terminal-focused? state) #f))))))))
