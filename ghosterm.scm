@@ -36,6 +36,7 @@
 
 (provide terminal
          terminal-exec
+         terminal-focus
          terminal-run
          terminal-toggle)
 
@@ -75,11 +76,7 @@
   (define term *terminal*)
 
   (set-box! (Terminal-active term) #t)
-  (set-box! (Terminal-focused? term) #t)
-
-  (auto-save-editor!)
-  (save-editor-cursor-shapes!)
-  (hide-editor-cursor!)
+  (focus-terminal!)
 
   (unless (unbox (Terminal-pushed? term))
     (set-box! (Terminal-pushed? term) #t)
@@ -99,9 +96,29 @@
 (define (terminal-loop-alive? term)
   (and term (not (unbox (Terminal-kill-switch term)))))
 
+(define (terminal-focus)
+  (cond
+    [(and *terminal* (unbox (Terminal-focused? *terminal*)))
+      (blur-terminal!)]
+    [(and *terminal* (unbox (Terminal-active *terminal*))
+        (terminal-loop-alive? *terminal*))
+      (focus-terminal!)
+      (helix.redraw)]
+    [else (show-terminal)]))
+
 (define (focus-terminal!)
   (when *terminal*
-    (set-box! (Terminal-focused? *terminal*) #t)))
+    (set-box! (Terminal-focused? *terminal*) #t)
+    (auto-save-editor!)
+    (save-editor-cursor-shapes!)
+    (hide-editor-cursor!)))
+
+(define (blur-terminal!)
+  (when *terminal*
+    (set-box! (Terminal-focused? *terminal*) #f)
+    (restore-editor-cursor!)
+    (hide-editor-cursor!)
+    (helix.redraw)))
 
 (struct Terminal
         (name cursor pty vte size focused? active pushed? kill-switch area
