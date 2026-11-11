@@ -295,6 +295,11 @@
     [(not (unbox (Terminal-focused? state)))
      event-result/ignore]
 
+    [(and (key-event? event)
+          (terminal-toggle-trigger? event))
+     (toggle-terminal)
+     event-result/consume]
+
     ;; Esc: return focus to editor.
     [(and (key-event? event)
           (key-event-escape? event))
@@ -311,6 +316,15 @@
      event-result/consume]
 
     [else event-result/ignore]))
+
+(define (terminal-toggle-trigger? event)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [c (key-event-char event)])
+    (and c
+        (or (= (char->integer c) 31)
+            (and (ghost-bit? mods 1)
+                 (or (char=? c #\7)
+                     (char=? c #\/)))))))
 
 (define (terminal-cursor-handler state _rect)
   (if (and (unbox (Terminal-active state))
