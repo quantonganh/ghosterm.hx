@@ -311,6 +311,15 @@
      (helix.redraw)
      event-result/consume]
 
+    ;; Ctrl-D: close terminal.
+    [(and (key-event? event)
+          (let ([c (key-event-char event)])
+            (and c
+                 (char=? c #\d)
+                 (ghost-bit? (or (key-event-modifier event) 0) 1))))
+     (kill-terminal)
+     event-result/consume]
+
     [(key-event? event)
      (handle-key-event state event)
      event-result/consume]
@@ -448,6 +457,26 @@
     (restore-editor-cursor!)
     (set-editor-clip-bottom! 0)
     (helix.redraw))
+
+(define (kill-terminal)
+  (let ([term *terminal*])
+    (when term
+      (set-box! (Terminal-active term) #f)
+      (set-box! (Terminal-focused? term) #f)
+      (set-box! (Terminal-cursor-shown? term) #f)
+
+      (set-box! (Terminal-kill-switch term) #t)
+
+      (pty-kill (Terminal-pty term))
+
+      (when (unbox (Terminal-pushed? term))
+        (pop-last-component! "ghosterm")
+        (set-box! (Terminal-pushed? term) #f))
+
+      (restore-editor-cursor!)
+      (set-editor-clip-bottom! 0)
+
+      (helix.redraw))))
 
 (define *editor-cursor-shapes* #f)
 
