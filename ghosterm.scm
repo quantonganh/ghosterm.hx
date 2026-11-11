@@ -77,6 +77,7 @@
   (set-box! (Terminal-active term) #t)
   (set-box! (Terminal-focused? term) #t)
 
+  (auto-save-editor!)
   (save-editor-cursor-shapes!)
   (hide-editor-cursor!)
 
@@ -308,6 +309,7 @@
           (terminal-focus-editor-trigger? event))
      (set-box! (Terminal-focused? state) #f)
      (restore-editor-cursor!)
+     (auto-reload-editor!)
      (helix.redraw)
      event-result/consume]
 
@@ -464,6 +466,7 @@
     (set-box! (Terminal-focused? term) #f)
     (set-box! (Terminal-active term) #f)
     (restore-editor-cursor!)
+    (auto-reload-editor!)
     (set-editor-clip-bottom! 0)
     (helix.redraw))
 
@@ -486,6 +489,23 @@
       (set-editor-clip-bottom! 0)
 
       (helix.redraw))))
+
+(define (auto-save-editor!)
+  (let ([doc (editor->doc-id (editor-focus))])
+    (when (and (editor-document->path doc)
+               (editor-document-dirty? doc))
+      (helix.write))))
+
+(define (auto-reload-editor!)
+  (unless (editor-has-dirty-documents?)
+    (helix.reload-all)))
+
+(define (editor-has-dirty-documents?)
+  (let loop ([docs (editor-all-documents)])
+    (cond
+      [(null? docs) #f]
+      [(editor-document-dirty? (car docs)) #t]
+      [else (loop (cdr docs))])))
 
 (define *editor-cursor-shapes* #f)
 
