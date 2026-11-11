@@ -303,9 +303,9 @@
      (toggle-terminal)
      event-result/consume]
 
-    ;; Esc: return focus to editor.
+    ;; Ctrl-\: return focus to editor.
     [(and (key-event? event)
-          (key-event-escape? event))
+          (terminal-focus-editor-trigger? event))
      (set-box! (Terminal-focused? state) #f)
      (restore-editor-cursor!)
      (helix.redraw)
@@ -338,6 +338,15 @@
             (and (ghost-bit? mods 1)
                  (or (char=? c #\7)
                      (char=? c #\/)))))))
+
+(define (terminal-focus-editor-trigger? event)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [c (key-event-char event)])
+    (and c
+        (or (= (char->integer c) 28)
+            (and (ghost-bit? mods 1)
+                 (or (char=? c #\4)
+                     (char=? c #\\)))))))
 
 (define (terminal-cursor-handler state _rect)
   (if (and (unbox (Terminal-active state))
