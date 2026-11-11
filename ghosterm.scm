@@ -77,6 +77,9 @@
   (set-box! (Terminal-active term) #t)
   (set-box! (Terminal-focused? term) #t)
 
+  (save-editor-cursor-shapes!)
+  (hide-editor-cursor!)
+
   (unless (unbox (Terminal-pushed? term))
     (set-box! (Terminal-pushed? term) #t)
     (push-component!
@@ -304,6 +307,7 @@
     [(and (key-event? event)
           (key-event-escape? event))
      (set-box! (Terminal-focused? state) #f)
+     (restore-editor-cursor!)
      (helix.redraw)
      event-result/consume]
 
@@ -441,8 +445,35 @@
     (define term *terminal*)
     (set-box! (Terminal-focused? term) #f)
     (set-box! (Terminal-active term) #f)
+    (restore-editor-cursor!)
     (set-editor-clip-bottom! 0)
     (helix.redraw))
+
+(define *editor-cursor-shapes* #f)
+
+(define (save-editor-cursor-shapes!)
+  (unless *editor-cursor-shapes*
+    (set! *editor-cursor-shapes*
+      (list
+        (string->symbol
+          (get-config-option-value "cursor-shape.normal"))
+        (string->symbol
+          (get-config-option-value "cursor-shape.insert"))
+        (string->symbol
+          (get-config-option-value "cursor-shape.select"))))))
+
+(define (hide-editor-cursor!)
+  (cursor-shape
+    #:normal 'hidden
+    #:insert 'hidden
+    #:select 'hidden))
+
+(define (restore-editor-cursor!)
+  (when *editor-cursor-shapes*
+    (cursor-shape
+      #:normal (list-ref *editor-cursor-shapes* 0)
+      #:insert (list-ref *editor-cursor-shapes* 1)
+      #:select (list-ref *editor-cursor-shapes* 2))))
 
 (define (terminal-run)
   (let ([command (run-command "run")])
