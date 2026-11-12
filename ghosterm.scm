@@ -3,8 +3,7 @@
 (require "helix/misc.scm")
 (require "helix/components.scm")
 (require (prefix-in helix. "helix/commands.scm"))
-(require "helix/editor.scm")
-(require "run.scm")
+(require "expansions.hx/expansions.scm")
 
 (#%require-dylib "libghosterm"
                  (only-in default-shell
@@ -38,6 +37,7 @@
          terminal-exec
          terminal-focus
          terminal-run
+         terminal-run-config
          terminal-toggle)
 
 (define *terminal* #f)
@@ -550,25 +550,69 @@
       #:insert (list-ref *editor-cursor-shapes* 1)
       #:select (list-ref *editor-cursor-shapes* 2))))
 
-(define (terminal-run)
-  (let ([command (run-command "run")])
-    (when command
-      (terminal-exec command))))
+(define terminal-run-config
+  '(
+    ("rust"
+      ("main.rs" . "cargo run")
+      ("*" . "cargo build"))
+
+    ("go"
+      ("main.go" . "go run *.go")
+      ("*" . "go build"))
+    ))
+
+(define (terminal-run language buffer-name)
+  (define language* (terminal-expand-argument language))
+  (define buffer-name* (terminal-expand-argument buffer-name))
+  (define command (terminal-run-command language* buffer-name*))
+  (if command
+      (terminal-exec command)
+      (set-status!
+        (string-append "No run command configured for " language*))))
+
+(define (terminal-expand-argument value)
+  (let ([result (expand value)])
+    (if (hash-ref result 'ok)
+        (hash-ref result 'text)
+        value)))
+
+(define (terminal-run-command language buffer-name)
+  (define basename (path-basename buffer-name))
+
+  (define language-config
+    (assoc language terminal-run-config))
+
+  (and language-config
+       (let* ([rules (cdr language-config)]
+              [rule (or (assoc basename rules)
+                        (assoc "*" rules))])
+         (and rule (cdr rule)))))
+
+(define (path-basename path)
+  (let loop ([i (- (string-length path) 1)])
+    (cond
+      [(< i 0) path]
+      [(char=? (string-ref path i) #\/)
+       (substring path (+ i 1) (string-length path))]
+      [else (loop (- i 1))])))
 
 (define (terminal-exec . args)
   (define command (terminal-exec-command args))
-  (if (string=? command "")
-    (set-status! "terminal-exec: missing command")
-    (begin
-      (show-terminal)
-      (let ([term *terminal*])
-        (when term
-          (pty-write
-            (Terminal-pty term)
-            (string-append command "\r"))
-
-          (set-box! (Terminal-focused? term) #t)
-          (helix.redraw))))))
+  (define result (expand command))
+  (if (not (hash-ref result 'ok))
+    (set-status! (hash-ref result 'error))
+    (let ([command (hash-ref result 'text)])
+      (if (string=? command "")
+        (set-status! "terminal-exec: missing command")
+        (begin
+          (show-terminal)
+          (let ([term *terminal*])
+            (when term
+              (pty-write
+                (Terminal-pty term)
+                (string-append command "\r"))
+              (set-box! (Terminal-focused? term) #t)
+              (helix.redraw))))))))
 
 (define (terminal-exec-command args)
   (string-join args " "))
