@@ -23,3 +23,4 @@ futures-time = "3"
 tokio = { version = "1", features = ["sync", "time"] }
 parking_lot = "0.13"
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "768add93c54ccdba3f5c4d8763789ab6416f3151" }
+libc = "0.2.191"

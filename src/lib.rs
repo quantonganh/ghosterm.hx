@@ -122,6 +122,21 @@ impl Pty {
         }
         .into_ffi()
     }
+
+    #[cfg(unix)]
+    fn foreground_pgid(&self) -> RResult<FFIValue, RBoxError> {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return RResult::ROk(FFIValue::BoolV(false));
+        };
+
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+
+        if pgid > 0 {
+            RResult::ROk(FFIValue::IntV(pgid as isize))
+        } else {
+            RResult::ROk(FFIValue::BoolV(false))
+        }
+    }
 }
 
 impl Drop for Pty {
@@ -512,6 +527,7 @@ fn create_module() -> FFIModule {
         .register_fn("pty-kill", Pty::kill)
         .register_fn("pty-alive?", Pty::alive)
         .register_fn("pty-read", Pty::async_read)
+        .register_fn("pty-foreground-process", Pty::foreground_pgid)
         .register_fn("virtual-terminal", virtual_terminal)
         .register_fn("vte/advance-bytes", VTerm::advance_bytes)
         .register_fn("vte/resize", VTerm::resize)

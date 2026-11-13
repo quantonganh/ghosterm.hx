@@ -626,6 +626,7 @@ dependencies = [
  "anyhow",
  "futures",
  "futures-time",
+ "libc",
  "libghostty-vt",
  "parking_lot 0.13.0",
  "portable-pty",
