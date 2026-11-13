@@ -42,7 +42,7 @@
 
 (define *terminal-shell* (default-shell))
 
-;; Each split direction owns a group of terminal tabs.
+;; Each terminal placement owns a group of terminal tabs.
 (define *terminals* (hash))
 (define *last-direction* 'bottom)
 (define *focused-direction* #f)
@@ -69,7 +69,10 @@
 (define (terminal-toggle) (toggle-terminal))
 
 (define (direction-name direction)
-  (if (eq? direction 'right) "right" "bottom"))
+  (cond
+    [(eq? direction 'right) "right"]
+    [(eq? direction 'float) "float"]
+    [else "bottom"]))
 
 (define (component-name direction)
   (string-append "ghosterm-" (direction-name direction)))
@@ -79,6 +82,7 @@
     [(not value) #f]
     [(equal? value "right") 'right]
     [(equal? value "bottom") 'bottom]
+    [(equal? value "float") 'float]
     [else #f]))
 
 (define (terminal-get direction)
@@ -104,9 +108,10 @@
       args))
 
 (define (set-editor-clip! direction amount)
-  (if (eq? direction 'right)
-      (set-editor-clip-right! amount)
-      (set-editor-clip-bottom! amount)))
+  (cond
+    [(eq? direction 'right) (set-editor-clip-right! amount)]
+    [(eq? direction 'bottom) (set-editor-clip-bottom! amount)]
+    [else void]))
 
 (struct TerminalTabs (direction tabs active pushed?))
 
@@ -129,7 +134,7 @@
 
 (define (spawn-terminal-tab direction)
   (define rows
-    (if (eq? direction 'right)
+    (if (or (eq? direction 'right) (eq? direction 'float))
         24
         (or *terminal-height* (default-terminal-height))))
   (define term (make-terminal direction *terminal-shell* rows 80))
@@ -220,13 +225,19 @@
   (set-box! (Terminal-active term) #t)
   (focus-terminal! direction)
 
-  (unless (unbox (TerminalTabs-pushed? group))
+  (define was-pushed? (unbox (TerminalTabs-pushed? group)))
+
+  (unless was-pushed?
     (set-box! (TerminalTabs-pushed? group) #t)
     (push-component!
      (new-component! (component-name direction)
                      group
                      terminal-render
                      (component-functions group))))
+
+  ;; Floating terminals must stay above the split panes.
+  (when (or (not (eq? direction 'float)) was-pushed?)
+    (raise-float!))
 
   (helix.redraw))
 
@@ -244,6 +255,20 @@
        (unbox (Terminal-active term))
        (terminal-loop-alive? term)))
 
+(define (raise-float!)
+  (define group (terminal-get 'float))
+  (define term (terminal-active-term 'float))
+  (when (and group
+             (unbox (TerminalTabs-pushed? group))
+             term
+             (unbox (Terminal-active term)))
+    (pop-last-component! (component-name 'float))
+    (push-component!
+     (new-component! (component-name 'float)
+                     group
+                     terminal-render
+                     (component-functions group)))))
+
 (define (terminal-cycle)
   (cond
     [(not *focused-direction*)
@@ -254,11 +279,23 @@
        [(terminal-visible? 'right)
         (focus-terminal! 'right)
         (helix.redraw)]
+       [(terminal-visible? 'float)
+        (focus-terminal! 'float)
+        (helix.redraw)]
        [else (set-status! "No terminal is open")])]
     [(eq? *focused-direction* 'bottom)
-     (if (terminal-visible? 'right)
+     (cond
+       [(terminal-visible? 'right)
+        (focus-terminal! 'right)
+        (helix.redraw)]
+       [(terminal-visible? 'float)
+        (focus-terminal! 'float)
+        (helix.redraw)]
+       [else (blur-terminal!)])]
+    [(eq? *focused-direction* 'right)
+     (if (terminal-visible? 'float)
          (begin
-           (focus-terminal! 'right)
+           (focus-terminal! 'float)
            (helix.redraw))
          (blur-terminal!))]
     [else
@@ -285,7 +322,7 @@
         (define other-term (terminal-active-term other))
         (when (and other-term (not (eq? other direction)))
           (set-box! (Terminal-focused? other-term) #f)))
-      (list 'bottom 'right))
+      (list 'bottom 'right 'float))
     (set-box! (Terminal-focused? term) #t)
     (set! *focused-direction* direction)
     (set! *last-direction* direction)
@@ -355,9 +392,10 @@
     (define direction (TerminalTabs-direction group))
     (define state (terminal-tabs-active-term group))
     (if (and state (unbox (Terminal-active state)))
-        (if (eq? direction 'right)
-            (render-right-terminal group state rect frame)
-            (render-bottom-terminal group state rect frame))
+        (cond
+          [(eq? direction 'right) (render-right-terminal group state rect frame)]
+          [(eq? direction 'float) (render-float-terminal group state rect frame)]
+          [else (render-bottom-terminal group state rect frame)])
         (set-editor-clip! direction 0))))
 
 (define (render-bottom-terminal group state rect frame)
@@ -511,6 +549,82 @@
 
      (define x-offset (+ (area-x pane) 1))
      (define y-offset (area-y pane))
+
+     (vte/reset-iterator! vt)
+     (while (vte/advance-iterator! vt)
+       (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
+
+     (define cursor (Terminal-cursor state))
+     (define cursor-y (vte/cursor-y vt))
+     (define cursor-x (vte/cursor-x vt))
+(define cursor-shown?
+        (and focused
+             (vte/cursor-visible? vt)
+             (>= cursor-y 0)
+             (< cursor-y text-rows)
+             (>= cursor-x 0)
+             (< cursor-x text-cols)))
+      (set-box! (Terminal-cursor-shown? state) cursor-shown?)
+      (when cursor-shown?
+        (set-position-row! cursor (+ y-offset cursor-y))
+        (set-position-col! cursor (+ x-offset cursor-x)))]))
+
+(define (float-pane-area rect)
+  (define total-width (area-width rect))
+  (define total-height (area-height rect))
+  (define max-width (- total-width 2))
+  (define max-height (- total-height 2))
+  (if (or (< max-width 3) (< max-height 3))
+      #f
+      (let* ([width (min max-width (max 20 (quotient (* total-width 9) 10)))]
+             [height (min max-height (max 5 (quotient (* total-height 9) 10)))])
+        (area (+ (area-x rect) (quotient (- total-width width) 2))
+              (+ (area-y rect) (quotient (- total-height height) 2))
+              width
+              height))))
+
+(define (render-float-terminal group state rect frame)
+  (define pane (float-pane-area rect))
+
+  (cond
+    [(not pane)
+     (set-editor-clip-bottom! 0)]
+
+    [else
+     (define vt (Terminal-vte state))
+     (define pty (Terminal-pty state))
+     (define focused (unbox (Terminal-focused? state)))
+
+     (define text-rows (max 1 (- (area-height pane) 2)))
+     (define text-cols (max 1 (- (area-width pane) 2)))
+
+     (set-editor-clip-bottom! 0)
+     (set-box! (Terminal-area state) pane)
+
+     (define target-size (list text-rows text-cols))
+     (unless (equal? (unbox (Terminal-size state)) target-size)
+       (set-box! (Terminal-size state) target-size)
+       (vte/resize vt text-rows text-cols)
+       (pty-resize pty text-rows text-cols))
+
+     (define theme-fg
+       (or (style->fg (theme->fg *helix.cx*)) Color/White))
+     (define theme-bg
+       (or (style->bg (theme->bg *helix.cx*)) Color/Black))
+     (define border-base (style-fg (theme->bg *helix.cx*) theme-fg))
+     (define border-style
+       (if focused border-base (style-with-dim border-base)))
+
+     (buffer/clear frame pane)
+     (block/render frame
+                   pane
+                   (make-block (theme->bg *helix.cx*)
+                               border-style
+                               "all"
+                               "plain"))
+
+     (define x-offset (+ (area-x pane) 1))
+     (define y-offset (+ (area-y pane) 1))
 
      (vte/reset-iterator! vt)
      (while (vte/advance-iterator! vt)
@@ -1147,8 +1261,11 @@
     (define rows (car size))
     (define cols (car (cdr size)))
     (define right? (eq? (Terminal-direction state) 'right))
-    (define origin-x (+ (area-x pane) (if right? 1 0)))
-    (define origin-y (+ (area-y pane) (if right? 0 1)))
+    (define float? (eq? (Terminal-direction state) 'float))
+    (define origin-x (+ (area-x pane)
+                         (if (or right? float?) 1 0)))
+    (define origin-y (+ (area-y pane)
+                         (if (or right? float?) 0 1)))
     (define cell-x (- (event-mouse-col event) origin-x))
     (define cell-y (- (event-mouse-row event) origin-y))
     (when (and (>= cell-x 0) (< cell-x cols)
