@@ -34,7 +34,6 @@
                           vte/scroll-bottom))
 
 (provide terminal
-         terminal-exec
          terminal-focus
          terminal-run
          terminal-run-config
@@ -566,7 +565,7 @@
   (define buffer-name* (terminal-expand-argument buffer-name))
   (define command (terminal-run-command language* buffer-name*))
   (if command
-      (terminal-exec command)
+      (terminal-exec-in command)
       (set-status!
         (string-append "No run command configured for " language*))))
 
@@ -596,8 +595,7 @@
        (substring path (+ i 1) (string-length path))]
       [else (loop (- i 1))])))
 
-(define (terminal-exec . args)
-  (define command (terminal-exec-command args))
+(define (terminal-exec-in command)
   (define result (expand command))
   (if (not (hash-ref result 'ok))
     (set-status! (hash-ref result 'error))
