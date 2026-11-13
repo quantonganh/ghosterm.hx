@@ -569,7 +569,7 @@
         (set-position-row! cursor (+ y-offset cursor-y))
         (set-position-col! cursor (+ x-offset cursor-x)))]))
 
-(define (float-pane-area rect)
+(define (float-pane-area rect index)
   (define total-width (area-width rect))
   (define total-height (area-height rect))
   (define max-width (- total-width 2))
@@ -577,33 +577,50 @@
   (if (or (< max-width 3) (< max-height 3))
       #f
       (let* ([width (min max-width (max 20 (quotient (* total-width 9) 10)))]
-             [height (min max-height (max 5 (quotient (* total-height 9) 10)))])
-        (area (+ (area-x rect) (quotient (- total-width width) 2))
-              (+ (area-y rect) (quotient (- total-height height) 2))
+             [height (min max-height (max 5 (quotient (* total-height 9) 10)))]
+             [stagger (min index 5)]
+             [x (+ (area-x rect)
+                   (quotient (- total-width width) 2)
+                   (* 4 stagger))]
+             [y (+ (area-y rect)
+                   (quotient (- total-height height) 2)
+                   (* 2 stagger))])
+        (area (min x (+ (area-x rect) (- total-width width)))
+              (min y (+ (area-y rect) (- total-height height)))
               width
               height))))
 
 (define (render-float-terminal group state rect frame)
-  (define pane (float-pane-area rect))
+  (define tabs (terminal-tabs-list group))
+  (define active (terminal-tabs-active-index group))
+  (define i 0)
+  ;; Render the background floats first so the active one stays on top.
+  (while (< i (length tabs))
+    (unless (= i active)
+      (render-float-term (list-ref tabs i) rect frame i))
+    (set! i (+ i 1)))
+  (render-float-term state rect frame active))
+
+(define (render-float-term term rect frame index)
+  (define pane (float-pane-area rect index))
 
   (cond
-    [(not pane)
-     (set-editor-clip-bottom! 0)]
+    [(not pane) void]
 
     [else
-     (define vt (Terminal-vte state))
-     (define pty (Terminal-pty state))
-     (define focused (unbox (Terminal-focused? state)))
+     (define vt (Terminal-vte term))
+     (define pty (Terminal-pty term))
+     (define focused (unbox (Terminal-focused? term)))
 
      (define text-rows (max 1 (- (area-height pane) 2)))
      (define text-cols (max 1 (- (area-width pane) 2)))
 
      (set-editor-clip-bottom! 0)
-     (set-box! (Terminal-area state) pane)
+     (set-box! (Terminal-area term) pane)
 
      (define target-size (list text-rows text-cols))
-     (unless (equal? (unbox (Terminal-size state)) target-size)
-       (set-box! (Terminal-size state) target-size)
+     (unless (equal? (unbox (Terminal-size term)) target-size)
+       (set-box! (Terminal-size term) target-size)
        (vte/resize vt text-rows text-cols)
        (pty-resize pty text-rows text-cols))
 
@@ -630,7 +647,7 @@
      (while (vte/advance-iterator! vt)
        (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
 
-     (define cursor (Terminal-cursor state))
+     (define cursor (Terminal-cursor term))
      (define cursor-y (vte/cursor-y vt))
      (define cursor-x (vte/cursor-x vt))
      (define cursor-shown?
@@ -640,7 +657,7 @@
             (< cursor-y text-rows)
             (>= cursor-x 0)
             (< cursor-x text-cols)))
-     (set-box! (Terminal-cursor-shown? state) cursor-shown?)
+     (set-box! (Terminal-cursor-shown? term) cursor-shown?)
      (when cursor-shown?
        (set-position-row! cursor (+ y-offset cursor-y))
        (set-position-col! cursor (+ x-offset cursor-x)))]))
@@ -731,9 +748,9 @@
 (define (terminal-event-handler group event)
   (define direction (TerminalTabs-direction group))
   (define state (terminal-tabs-active-term group))
-  (define bottom? (eq? direction 'bottom))
+  (define tabs? (not (eq? direction 'right)))
   (define selected-tab
-    (and bottom? (key-event? event) (terminal-select-tab-index event)))
+    (and tabs? (key-event? event) (terminal-select-tab-index event)))
   (cond
     [(not (and state (unbox (Terminal-active state))))
      event-result/ignore]
@@ -750,15 +767,15 @@
     [(not (unbox (Terminal-focused? state)))
      event-result/ignore]
 
-    [(and bottom? (terminal-new-tab-trigger? event))
+    [(and tabs? (terminal-new-tab-trigger? event))
      (new-terminal-tab direction)
      event-result/consume]
 
-    [(and bottom? (terminal-next-tab-trigger? event))
+    [(and tabs? (terminal-next-tab-trigger? event))
      (switch-terminal-tab-relative direction 1)
      event-result/consume]
 
-    [(and bottom? (terminal-prev-tab-trigger? event))
+    [(and tabs? (terminal-prev-tab-trigger? event))
      (switch-terminal-tab-relative direction -1)
      event-result/consume]
 
@@ -1110,6 +1127,13 @@
        (>= (event-mouse-row event) (area-y pane))
        (< (event-mouse-row event) (+ (area-y pane) (area-height pane)))))
 
+(define (float-tab-index-at-click group event)
+  (let loop ([tabs (terminal-tabs-list group)] [i 0])
+    (cond
+      [(null? tabs) #f]
+      [(mouse-inside-terminal? (car tabs) event) i]
+      [else (loop (cdr tabs) (+ i 1))])))
+
 (define (handle-mouse-event group event)
   (define direction (TerminalTabs-direction group))
   (define state (terminal-tabs-active-term group))
@@ -1129,6 +1153,18 @@
      (switch-terminal-tab! direction tab-index)
      (focus-terminal! direction)
      (helix.redraw)
+     event-result/consume]
+
+    [(and (eq? direction 'float)
+          (not tab-index)
+          (or (<= kind 2) (= kind 10) (= kind 11))
+          (let ([idx (float-tab-index-at-click group event)])
+            (and idx
+                 (begin
+                   (switch-terminal-tab! direction idx)
+                   (focus-terminal! direction)
+                   (helix.redraw)
+                   #t))))
      event-result/consume]
 
     ;; Clicks outside the pane belong to the editor. If the terminal had
