@@ -40,6 +40,7 @@
          terminal-toggle)
 
 (define *terminal* #f)
+(define *terminal-tabs* #f)
 (define *terminal-shell* (default-shell))
 
 ;; Number of text rows the bottom pane occupies (the top border is extra).
@@ -60,37 +61,127 @@
 (define (terminal-toggle) (toggle-terminal))
 
 (define (show-terminal)
-  (unless (terminal-loop-alive? *terminal*)
-    (when (and *terminal*
-               (unbox (Terminal-pushed? *terminal*)))
-      (pop-last-component! "ghosterm"))
+  (unless *terminal-tabs*
+    (set! *terminal-tabs*
+          (TerminalTabs (box '()) (box 0) (box #f))))
 
-    (set! *terminal*
-          (make-terminal *terminal-shell*
-                         (or *terminal-height* (default-terminal-height))
-                         80))
+  (define group *terminal-tabs*)
 
-    (terminal-loop *terminal*))
+  (when (null? (terminal-tabs-list group))
+    (append-terminal-tab! group (spawn-terminal-tab)))
 
-  (define term *terminal*)
+  (define term (terminal-tabs-active-term group))
 
+  (unless (terminal-loop-alive? term)
+    (replace-terminal-tab! group (terminal-tabs-active-index group)
+                           (spawn-terminal-tab))
+    (set! term (terminal-tabs-active-term group)))
+
+  (set! *terminal* term)
   (set-box! (Terminal-active term) #t)
   (focus-terminal!)
 
-  (unless (unbox (Terminal-pushed? term))
-    (set-box! (Terminal-pushed? term) #t)
+  (unless (unbox (TerminalTabs-pushed? group))
+    (set-box! (TerminalTabs-pushed? group) #t)
     (push-component!
      (new-component! "ghosterm"
-                     term
-                     (Terminal-renderer term)
-                     (component-functions term))))
+                     group
+                     terminal-render
+                     (component-functions group))))
 
   (helix.redraw))
 
-(define (component-functions term)
+(struct TerminalTabs (tabs active pushed?))
+
+(define (terminal-tabs-list group)
+  (unbox (TerminalTabs-tabs group)))
+
+(define (terminal-tabs-active-index group)
+  (unbox (TerminalTabs-active group)))
+
+(define (terminal-tabs-active-term group)
+  (define tabs (terminal-tabs-list group))
+  (define index (terminal-tabs-active-index group))
+  (if (or (null? tabs) (>= index (length tabs)))
+      #f
+      (list-ref tabs index)))
+
+(define (spawn-terminal-tab)
+  (define term (make-terminal *terminal-shell*
+                              (or *terminal-height* (default-terminal-height))
+                              80))
+  (terminal-loop term)
+  term)
+
+(define (append-terminal-tab! group term)
+  (define tabs (terminal-tabs-list group))
+  (set-box! (TerminalTabs-tabs group) (append tabs (list term)))
+  (set-box! (TerminalTabs-active group) (length tabs))
+  (set-box! (Terminal-active term) #t))
+
+(define (replace-terminal-tab! group index term)
+  (set-box! (TerminalTabs-tabs group)
+            (replace-list-at (terminal-tabs-list group) index term)))
+
+(define (replace-list-at items index value)
+  (cond
+    [(null? items) (list value)]
+    [(= index 0) (cons value (cdr items))]
+    [else (cons (car items)
+                (replace-list-at (cdr items) (- index 1) value))]))
+
+(define (remove-list-at items index)
+  (cond
+    [(null? items) '()]
+    [(= index 0) (cdr items)]
+    [else (cons (car items) (remove-list-at (cdr items) (- index 1)))]))
+
+(define (new-terminal-tab)
+  (if (not *terminal-tabs*)
+      (show-terminal)
+      (let* ([group *terminal-tabs*]
+             [old *terminal*]
+             [was-focused? (and old (unbox (Terminal-focused? old)))]
+             [term (spawn-terminal-tab)])
+        (when old
+          (set-box! (Terminal-focused? old) #f))
+        (append-terminal-tab! group term)
+        (set! *terminal* term)
+        (set-box! (Terminal-active term) #t)
+        (when was-focused?
+          (set-box! (Terminal-focused? term) #t))
+        (helix.redraw))))
+
+(define (switch-terminal-tab! index)
+  (define group *terminal-tabs*)
+  (when group
+    (let* ([tabs (terminal-tabs-list group)]
+           [count (length tabs)])
+      (when (and (>= index 0) (< index count))
+        (let* ([old *terminal*]
+               [was-focused? (and old (unbox (Terminal-focused? old)))])
+          (when old
+            (set-box! (Terminal-focused? old) #f))
+          (set-box! (TerminalTabs-active group) index)
+          (let ([term (terminal-tabs-active-term group)])
+            (set! *terminal* term)
+            (set-box! (Terminal-active term) #t)
+            (when was-focused?
+              (set-box! (Terminal-focused? term) #t))
+            (helix.redraw)))))))
+
+(define (switch-terminal-tab-relative delta)
+  (define group *terminal-tabs*)
+  (when group
+    (let ([count (length (terminal-tabs-list group))])
+      (when (> count 0)
+        (switch-terminal-tab!
+         (modulo (+ (terminal-tabs-active-index group) delta) count))))))
+
+(define (component-functions group)
     (define with-handle
-        (hash-insert (hash) "handle_event" (Terminal-event-handler term)))
-    (hash-insert with-handle "cursor" (Terminal-cursor-handler term)))
+        (hash-insert (hash) "handle_event" terminal-event-handler))
+    (hash-insert with-handle "cursor" terminal-cursor-handler))
 
 (define (terminal-loop-alive? term)
   (and term (not (unbox (Terminal-kill-switch term)))))
@@ -120,14 +211,12 @@
     (helix.redraw)))
 
 (struct Terminal
-        (name cursor pty vte size focused? active pushed? kill-switch area
-              cursor-shown? renderer event-handler cursor-handler))
+        (cursor pty vte size focused? active kill-switch area cursor-shown?))
 
 (define (make-terminal shell rows cols)
   (define pty (create-pty shell rows cols))
   (define vt (virtual-terminal pty rows cols))
-  (Terminal "ghosterm"
-            (position 0 0)
+  (Terminal (position 0 0)
             pty
             vt
             (box #f)
@@ -135,11 +224,7 @@
             (box #f)
             (box #f)
             (box #f)
-            (box #f)
-            (box #f)
-            terminal-render
-            terminal-event-handler
-            terminal-cursor-handler))
+            (box #f)))
 
 (define (terminal-loop term)
   (define pty (Terminal-pty term))
@@ -163,13 +248,14 @@
             (set-box! (Terminal-focused? term) #f)
             (helix.redraw)])))))
 
-(define (terminal-render state rect frame)
-  (when state
-    (if (unbox (Terminal-active state))
-        (render-bottom-terminal state rect frame)
+(define (terminal-render group rect frame)
+  (when group
+    (define state (terminal-tabs-active-term group))
+    (if (and state (unbox (Terminal-active state)))
+        (render-bottom-terminal group state rect frame)
         (set-editor-clip-bottom! 0))))
 
-(define (render-bottom-terminal state rect frame)
+(define (render-bottom-terminal group state rect frame)
   (define pane (terminal-pane-area rect))
 
   (cond
@@ -213,12 +299,7 @@
                                "top"
                                "plain"))
 
-     (when (> (area-width pane) 16)
-       (frame-set-string! frame
-                          (+ (area-x pane) 2)
-                          (area-y pane)
-                          " terminal "
-                          border-style))
+     (render-tab-bar frame pane group focused border-base border-style)
 
      (define x-offset (area-x pane))
      (define y-offset (+ (area-y pane) 1))
@@ -244,6 +325,45 @@
      (when cursor-shown?
        (set-position-row! cursor (+ y-offset cursor-y))
        (set-position-col! cursor (+ x-offset cursor-x)))]))
+
+(define (tab-label index)
+  (string-append " " (number->string (+ index 1)) " "))
+
+(define (render-tab-bar frame pane group focused border-base border-style)
+  (define x (+ (area-x pane) 1))
+  (define max-x (+ (area-x pane) (area-width pane)))
+  (let loop ([tabs (terminal-tabs-list group)]
+             [i 0])
+    (when (pair? tabs)
+      (let* ([label (tab-label i)]
+             [style
+              (cond
+                [(= i (terminal-tabs-active-index group))
+                 (if focused (style-with-bold border-base) border-style)]
+                [else
+                 (if focused (style-with-dim border-base) border-style)])])
+        (when (< (+ x (string-length label)) max-x)
+          (frame-set-string! frame x (area-y pane) label style)
+          (set! x (+ x (string-length label) 1))))
+      (loop (cdr tabs) (+ i 1)))))
+
+(define (tab-index-at-column group pane col)
+  (define x (+ (area-x pane) 1))
+  (define max-x (+ (area-x pane) (area-width pane)))
+  (let loop ([tabs (terminal-tabs-list group)]
+             [i 0])
+    (cond
+      [(null? tabs) #f]
+      [else
+       (let* ([label (tab-label i)]
+              [width (string-length label)])
+         (if (and (>= col x)
+                  (< col (+ x width))
+                  (< (+ x width) max-x))
+             i
+             (begin
+               (set! x (+ x width 1))
+               (loop (cdr tabs) (+ i 1)))))])))
 
 (define (render-current-cell vt frame x-offset y-offset theme-fg theme-bg)
   (define text (vte/iter-cell-str vt))
@@ -304,16 +424,38 @@
         (define y (- total pane-height))
         (area (area-x rect) y (area-width rect) pane-height))))
 
-(define (terminal-event-handler state event)
+(define (terminal-event-handler group event)
+  (define state (terminal-tabs-active-term group))
+  (define selected-tab (and (key-event? event)
+                            (terminal-select-tab-index event)))
   (cond
-    [(not (unbox (Terminal-active state)))
+    [(not (and state (unbox (Terminal-active state))))
      event-result/ignore]
 
     [(mouse-event? event)
-     (handle-mouse-event state event)]
+     (handle-mouse-event group event)]
 
     [(not (unbox (Terminal-focused? state)))
      event-result/ignore]
+
+    [(and (key-event? event)
+          (terminal-new-tab-trigger? event))
+     (new-terminal-tab)
+     event-result/consume]
+
+    [(and (key-event? event)
+          (terminal-next-tab-trigger? event))
+     (switch-terminal-tab-relative 1)
+     event-result/consume]
+
+    [(and (key-event? event)
+          (terminal-prev-tab-trigger? event))
+     (switch-terminal-tab-relative -1)
+     event-result/consume]
+
+    [selected-tab
+     (switch-terminal-tab! selected-tab)
+     event-result/consume]
 
     [(and (key-event? event)
           (terminal-toggle-trigger? event))
@@ -329,13 +471,13 @@
      (helix.redraw)
      event-result/consume]
 
-    ;; Ctrl-D: close terminal.
+    ;; Ctrl-D: close the active tab.
     [(and (key-event? event)
           (let ([c (key-event-char event)])
             (and c
                  (char=? c #\d)
                  (ghost-bit? (or (key-event-modifier event) 0) 1))))
-     (kill-terminal)
+     (close-terminal-tab)
      event-result/consume]
 
     [(key-event? event)
@@ -366,8 +508,34 @@
                  (or (char=? c #\4)
                      (char=? c #\\)))))))
 
-(define (terminal-cursor-handler state _rect)
-  (if (and (unbox (Terminal-active state))
+(define (alt-key? event c)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [ch (key-event-char event)])
+    (and ch
+         (ghost-bit? mods 2)
+         (char=? ch c))))
+
+(define (terminal-new-tab-trigger? event)
+  (alt-key? event #\t))
+
+(define (terminal-next-tab-trigger? event)
+  (alt-key? event #\n))
+
+(define (terminal-prev-tab-trigger? event)
+  (alt-key? event #\p))
+
+(define (terminal-select-tab-index event)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [c (key-event-char event)])
+    (and c
+         (ghost-bit? mods 2)
+         (let ([code (char->integer c)])
+           (and (>= code 49) (<= code 57) (- code 49))))))
+
+(define (terminal-cursor-handler group _rect)
+  (define state (terminal-tabs-active-term group))
+  (if (and state
+           (unbox (Terminal-active state))
            (unbox (Terminal-focused? state))
            (unbox (Terminal-cursor-shown? state)))
       (Terminal-cursor state)
@@ -486,25 +654,39 @@
     (set-editor-clip-bottom! 0)
     (helix.redraw))
 
-(define (kill-terminal)
-  (let ([term *terminal*])
-    (when term
-      (set-box! (Terminal-active term) #f)
-      (set-box! (Terminal-focused? term) #f)
-      (set-box! (Terminal-cursor-shown? term) #f)
-
-      (set-box! (Terminal-kill-switch term) #t)
-
-      (pty-kill (Terminal-pty term))
-
-      (when (unbox (Terminal-pushed? term))
-        (pop-last-component! "ghosterm")
-        (set-box! (Terminal-pushed? term) #f))
-
-      (restore-editor-cursor!)
-      (set-editor-clip-bottom! 0)
-
-      (helix.redraw))))
+(define (close-terminal-tab)
+  (define group *terminal-tabs*)
+  (when group
+    (let* ([tabs (terminal-tabs-list group)]
+           [index (terminal-tabs-active-index group)])
+      (when (< index (length tabs))
+        (let* ([term (list-ref tabs index)]
+               [was-focused? (unbox (Terminal-focused? term))])
+          (set-box! (Terminal-active term) #f)
+          (set-box! (Terminal-focused? term) #f)
+          (set-box! (Terminal-cursor-shown? term) #f)
+          (set-box! (Terminal-kill-switch term) #t)
+          (pty-kill (Terminal-pty term))
+          (let ([remaining (remove-list-at tabs index)])
+            (set-box! (TerminalTabs-tabs group) remaining)
+            (cond
+              [(null? remaining)
+               (when (unbox (TerminalTabs-pushed? group))
+                 (pop-last-component! "ghosterm")
+                 (set-box! (TerminalTabs-pushed? group) #f))
+               (set! *terminal-tabs* #f)
+               (set! *terminal* #f)
+               (restore-editor-cursor!)
+               (auto-reload-editor!)
+               (set-editor-clip-bottom! 0)]
+              [else
+               (let ([new-index (min index (- (length remaining) 1))])
+                 (set-box! (TerminalTabs-active group) new-index)
+                 (let ([new-term (terminal-tabs-active-term group)])
+                   (set! *terminal* new-term)
+                   (set-box! (Terminal-active new-term) #t)
+                   (set-box! (Terminal-focused? new-term) was-focused?)))]))
+          (helix.redraw))))))
 
 (define (auto-save-editor!)
   (let ([doc (editor->doc-id (editor-focus))])
@@ -623,11 +805,22 @@
        (>= (event-mouse-row event) (area-y pane))
        (< (event-mouse-row event) (+ (area-y pane) (area-height pane)))))
 
-(define (handle-mouse-event state event)
+(define (handle-mouse-event group event)
+  (define state (terminal-tabs-active-term group))
   (define kind (event-mouse-kind event))
+  (define pane (and state (unbox (Terminal-area state))))
+  (define tab-index
+    (and pane
+         (= kind 0)
+         (= (event-mouse-row event) (area-y pane))
+         (tab-index-at-column group pane (event-mouse-col event))))
   (cond
-    [(unbox (Terminal-kill-switch state))
+    [(or (not state) (unbox (Terminal-kill-switch state)))
      event-result/ignore]
+
+    [tab-index
+     (switch-terminal-tab! tab-index)
+     event-result/consume]
 
     ;; Clicks outside the pane belong to the editor. If the terminal had
     ;; focus, let go of it so the editor receives keys again.
