@@ -62,11 +62,14 @@
         24)))
 
 (define (terminal . args)
-  (if (null? args)
-    (show-terminal))
-    (terminal-exec-in (terminal-exec-command args)))
+  (define direction (direction-argument args 'bottom))
+  (if (null? (command-arguments args))
+      (show-terminal direction)
+      (terminal-exec-in direction
+                        (terminal-exec-command (command-arguments args)))))
 
-(define (terminal-toggle) (toggle-terminal))
+(define (terminal-toggle . args)
+  (toggle-terminal (direction-argument args (terminal-default-direction))))
 
 (define (direction-name direction)
   (cond
