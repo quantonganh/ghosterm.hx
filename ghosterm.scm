@@ -25,9 +25,11 @@
                           vte/iter-cell-fg
                           vte/iter-cell-bg
                           vte/iter-cell-attrs
+                          vte/render-cells
                           vte/cursor-x
                           vte/cursor-y
                           vte/cursor-visible?
+                          vte/scroll-offset
                           vte/scroll-up
                           vte/scroll-down
                           vte/scroll-top
@@ -375,8 +377,8 @@
     (helix.redraw)))
 
 (struct Terminal
-        (direction cursor pty vte size focused? active kill-switch area
-              cursor-shown?))
+         (direction cursor pty vte size focused? active kill-switch area
+               cursor-shown? selection))
 
 (define (make-terminal direction shell rows cols)
   (define pty (create-pty shell rows cols))
@@ -385,6 +387,7 @@
             (position 0 0)
             pty
             vt
+            (box #f)
             (box #f)
             (box #f)
             (box #f)
@@ -401,12 +404,13 @@
       (helix-await-callback
        (pty-read pty)
        (lambda (bytes)
-         (cond
-           [bytes
-            (vte/advance-bytes vt bytes)
-            (terminal-loop term)]
-           [(pty-alive? pty)
-            (terminal-loop term)]
+          (cond
+            [bytes
+             (set-box! (Terminal-selection term) #f)
+             (vte/advance-bytes vt bytes)
+             (terminal-loop term)]
+            [(pty-alive? pty)
+             (terminal-loop term)]
             [else
              ;; Keep the final screen visible; the next show command will
              ;; replace this component with a fresh shell.
@@ -455,6 +459,7 @@
      (define target-size (list text-rows cols))
      (unless (equal? (unbox (Terminal-size state)) target-size)
        (set-box! (Terminal-size state) target-size)
+       (set-box! (Terminal-selection state) #f)
        (vte/resize vt text-rows cols)
        (pty-resize pty text-rows cols))
 
@@ -476,12 +481,12 @@
                                "plain"))
      (render-tab-bar frame pane group focused border-base border-style)
 
-     (define x-offset (area-x pane))
-     (define y-offset (+ (area-y pane) 1))
+      (define x-offset (area-x pane))
+      (define y-offset (+ (area-y pane) 1))
 
-     (vte/reset-iterator! vt)
-     (while (vte/advance-iterator! vt)
-       (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
+       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                               (unbox (Terminal-selection state)))
+
 
      (define cursor (Terminal-cursor state))
      (define cursor-y (vte/cursor-y vt))
@@ -561,6 +566,7 @@
      (define target-size (list text-rows text-cols))
      (unless (equal? (unbox (Terminal-size state)) target-size)
        (set-box! (Terminal-size state) target-size)
+       (set-box! (Terminal-selection state) #f)
        (vte/resize vt text-rows text-cols)
        (pty-resize pty text-rows text-cols))
 
@@ -580,12 +586,12 @@
                                "left"
                                "plain"))
 
-     (define x-offset (+ (area-x pane) 1))
-     (define y-offset (area-y pane))
+      (define x-offset (+ (area-x pane) 1))
+      (define y-offset (area-y pane))
 
-     (vte/reset-iterator! vt)
-     (while (vte/advance-iterator! vt)
-       (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
+       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                               (unbox (Terminal-selection state)))
+
 
      (define cursor (Terminal-cursor state))
      (define cursor-y (vte/cursor-y vt))
@@ -677,6 +683,7 @@
      (define target-size (list text-rows text-cols))
      (unless (equal? (unbox (Terminal-size term)) target-size)
        (set-box! (Terminal-size term) target-size)
+       (set-box! (Terminal-selection term) #f)
        (vte/resize vt text-rows text-cols)
        (pty-resize pty text-rows text-cols))
 
@@ -696,14 +703,14 @@
                                "all"
                                "plain"))
 
-     (define x-offset (+ (area-x pane) 1))
-     (define y-offset (+ (area-y pane) 1))
+      (define x-offset (+ (area-x pane) 1))
+      (define y-offset (+ (area-y pane) 1))
 
-     (vte/reset-iterator! vt)
-     (while (vte/advance-iterator! vt)
-       (render-current-cell vt frame x-offset y-offset theme-fg theme-bg))
+       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                               (unbox (Terminal-selection term)))
 
-     (define cursor (Terminal-cursor term))
+
+      (define cursor (Terminal-cursor term))
      (define cursor-y (vte/cursor-y vt))
      (define cursor-x (vte/cursor-x vt))
      (define cursor-shown?
@@ -718,18 +725,81 @@
        (set-position-row! cursor (+ y-offset cursor-y))
        (set-position-col! cursor (+ x-offset cursor-x)))]))
 
-(define (render-current-cell vt frame x-offset y-offset theme-fg theme-bg)
-  (define text (vte/iter-cell-str vt))
-  (unless (string=? text "")
-    (frame-set-string! frame
-                       (+ x-offset (vte/iter-x vt))
-                       (+ y-offset (vte/iter-y vt))
-                       text
-                       (cell-style (vte/iter-cell-fg vt)
-                                   (vte/iter-cell-bg vt)
-                                   (vte/iter-cell-attrs vt)
-                                   theme-fg
-                                   theme-bg))))
+(define (render-cell-group? group cell)
+  (and (= (list-ref cell 0)
+          (+ (list-ref group 0) (list-ref group 7)))
+       (= (list-ref cell 1) (list-ref group 1))
+       (= (list-ref cell 2) (list-ref group 2))
+       (= (list-ref cell 3) (list-ref group 3))
+       (= (list-ref cell 4) (list-ref group 4))
+       (eq? (list-ref cell 6) (list-ref group 6))))
+
+(define (render-cell-group! group frame x-offset y-offset theme-fg theme-bg)
+  (define base (cell-style (list-ref group 2)
+                           (list-ref group 3)
+                           (list-ref group 4)
+                           theme-fg
+                           theme-bg))
+  (define style (if (list-ref group 6)
+                    (style-with-reversed base)
+                    base))
+  (frame-set-string! frame
+                     (+ x-offset (list-ref group 0))
+                     (+ y-offset (list-ref group 1))
+                     (list-ref group 5)
+                     style))
+
+(define (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg selection)
+  (let loop ([cells (vte/render-cells vt)]
+             [group #f])
+    (cond
+      [(null? cells)
+       (when group
+         (render-cell-group! group frame x-offset y-offset theme-fg theme-bg))]
+      [else
+       (let* ([x (car cells)]
+              [tail1 (cdr cells)]
+              [y (car tail1)]
+              [tail2 (cdr tail1)]
+              [fg (car tail2)]
+              [tail3 (cdr tail2)]
+              [bg (car tail3)]
+              [tail4 (cdr tail3)]
+              [attrs (car tail4)]
+              [tail5 (cdr tail4)]
+              [text (car tail5)]
+              [rest (cdr tail5)]
+              [cell (list x y fg bg attrs text
+                          (and (cell-selected? selection x y) #t)
+                          1)])
+         (cond
+           [(and group (render-cell-group? group cell))
+            (loop rest
+                  (list (list-ref group 0)
+                        (list-ref group 1)
+                        (list-ref group 2)
+                        (list-ref group 3)
+                        (list-ref group 4)
+                        (string-append (list-ref group 5) (list-ref cell 5))
+                        (list-ref group 6)
+                        (+ (list-ref group 7) 1)))]
+           [else
+            (when group
+              (render-cell-group! group frame x-offset y-offset theme-fg theme-bg))
+            (loop rest cell)]))])))
+
+(define (cell-selected? selection x y)
+  (and selection
+       (let ([x1 (list-ref selection 0)]
+             [y1 (list-ref selection 1)]
+             [x2 (list-ref selection 2)]
+             [y2 (list-ref selection 3)])
+         (cond
+           [(or (< y y1) (> y y2)) #f]
+           [(= y1 y2) (and (>= x x1) (< x x2))]
+           [(= y y1) (>= x x1)]
+           [(= y y2) (< x x2)]
+           [else #t]))))
 
 (define (cell-style fg bg attrs theme-fg theme-bg)
   (define inverse? (ghost-bit? attrs 4))
@@ -1183,6 +1253,102 @@
        (>= (event-mouse-row event) (area-y pane))
        (< (event-mouse-row event) (+ (area-y pane) (area-height pane)))))
 
+(define (terminal-cell-at state event)
+  (define pane (unbox (Terminal-area state)))
+  (define size (unbox (Terminal-size state)))
+  (if (and pane size)
+      (let* ([rows (car size)]
+             [cols (car (cdr size))]
+             [right? (eq? (Terminal-direction state) 'right)]
+             [float? (eq? (Terminal-direction state) 'float)]
+             [origin-x (+ (area-x pane) (if (or right? float?) 1 0))]
+             [origin-y (+ (area-y pane) (if (or right? float?) 0 1))]
+             [x (- (event-mouse-col event) origin-x)]
+             [y (- (event-mouse-row event) origin-y)])
+        (and (>= x 0) (< x cols) (>= y 0) (< y rows) (list x y)))
+      #f))
+
+(define (start-selection! state cell)
+  (define x (car cell))
+  (define y (car (cdr cell)))
+  (set-box! (Terminal-selection state) (list x y x y)))
+
+(define (update-selection! state cell)
+  (define selection (unbox (Terminal-selection state)))
+  (when selection
+    (let ([x1 (list-ref selection 0)]
+          [y1 (list-ref selection 1)]
+          [x2 (car cell)]
+          [y2 (car (cdr cell))])
+      (set-box! (Terminal-selection state)
+                (cond
+                  [(< y2 y1) (list x2 y2 x1 y1)]
+                  [(and (= y2 y1) (< x2 x1)) (list x2 y2 x1 y1)]
+                  [else (list x1 y1 x2 y2)])))))
+
+(define (selection-empty? selection)
+  (and selection
+       (= (list-ref selection 0) (list-ref selection 2))
+       (= (list-ref selection 1) (list-ref selection 3))))
+
+(define (shift-selection-y! state delta)
+  (unless (= delta 0)
+    (define selection (unbox (Terminal-selection state)))
+    (when selection
+      (set-box! (Terminal-selection state)
+                (list (list-ref selection 0)
+                      (+ (list-ref selection 1) delta)
+                      (list-ref selection 2)
+                      (+ (list-ref selection 3) delta))))))
+
+(define (scroll-active-terminal! group kind)
+  (define state (terminal-tabs-active-term group))
+  (when state
+    (define selection (unbox (Terminal-selection state)))
+    (define vt (Terminal-vte state))
+    (define before (and selection (vte/scroll-offset vt)))
+    (cond
+      [(= kind 10) (vte/scroll-down vt 3)]
+      [(= kind 11) (vte/scroll-up vt 3)])
+    (when before
+      (shift-selection-y! state (- before (vte/scroll-offset vt))))))
+
+(define (selection->text state selection)
+  (define size (unbox (Terminal-size state)))
+  (if (not size)
+      ""
+      (let* ([cols (car (cdr size))]
+             [vt (Terminal-vte state)]
+             [x1 (min cols (list-ref selection 0))]
+             [y1 (list-ref selection 1)]
+             [x2 (min cols (list-ref selection 2))]
+             [y2 (list-ref selection 3)])
+        (if (= y1 y2)
+            (substring (terminal-row-text vt y1 cols) x1 x2)
+            (string-join
+             (append
+              (list (substring (terminal-row-text vt y1 cols) x1 cols))
+              (terminal-rows-text vt (+ y1 1) y2 cols)
+              (list (substring (terminal-row-text vt y2 cols) 0 x2)))
+             "\n")))))
+
+(define (terminal-rows-text vt from to cols)
+  (let loop ([y from] [acc '()])
+    (if (>= y to)
+        (reverse acc)
+        (loop (+ y 1) (cons (terminal-row-text vt y cols) acc)))))
+
+(define (copy-selection! state . maybe-announce)
+  (define announce? (if (pair? maybe-announce) (car maybe-announce) #t))
+  (define selection (unbox (Terminal-selection state)))
+  (when (and selection (not (selection-empty? selection)))
+    (define text (selection->text state selection))
+    (unless (string=? text "")
+      (set-register! #\+ (list text))
+      (set-register! #\* (list text))
+      (when announce?
+        (set-status! "Copied terminal selection")))))
+
 (define (float-tab-index-at-click group event)
   (define tabs (terminal-tabs-list group))
   (define active (terminal-tabs-active-index group))
@@ -1222,12 +1388,25 @@
           (not tab-index)
           (or (<= kind 2) (= kind 10) (= kind 11))
           (let ([idx (float-tab-index-at-click group event)])
-            (and idx
-                 (begin
-                   (switch-terminal-tab! direction idx)
-                   (focus-terminal! direction)
-                   (helix.redraw)
-                   #t))))
+                 (and idx
+                      (not (= idx (terminal-tabs-active-index group)))
+                      (begin
+                    (switch-terminal-tab! direction idx)
+                    (focus-terminal! direction)
+                    (when (or (= kind 10) (= kind 11))
+                      (scroll-active-terminal! group kind))
+                    (helix.redraw)
+                    #t))))
+      event-result/consume]
+
+    ;; A release after a drag copies even when the pointer left the pane.
+    [(and (= kind 3)
+          (let ([selection (unbox (Terminal-selection state))])
+            (and selection (not (selection-empty? selection)))))
+     (define cell (terminal-cell-at state event))
+     (when cell (update-selection! state cell))
+     (copy-selection! state)
+     (helix.redraw)
      event-result/consume]
 
     ;; Clicks outside the pane belong to the editor. If the terminal had
@@ -1238,16 +1417,35 @@
      event-result/ignore]
 
     [else
-     ;; Focus on presses and wheel events, but not on releases: the release
-     ;; that follows opening a path must not steal focus back from the editor.
-     (when (or (<= kind 2) (= kind 10) (= kind 11))
-       (focus-terminal! direction))
+     (define cell (terminal-cell-at state event))
      (cond
-       [(= kind 10) (vte/scroll-down (Terminal-vte state) 3)]
-       [(= kind 11) (vte/scroll-up (Terminal-vte state) 3)]
-       [(= kind 0) (open-path-at-click state event)]
-       [else void])
-     (helix.redraw)
+       [(= kind 0)
+        (when cell (start-selection! state cell))
+        (focus-terminal! direction)
+        (helix.redraw)]
+
+       [(= kind 6)
+        (when cell (update-selection! state cell))
+        (copy-selection! state #f)
+        (helix.redraw)]
+
+       [(= kind 3)
+        (define selection (unbox (Terminal-selection state)))
+        (cond
+          [(and cell (selection-empty? selection))
+           (open-path-at-click state event)]
+          [(and cell selection)
+           (update-selection! state cell)
+           (copy-selection! state)]
+          [else void])
+        (helix.redraw)]
+
+        [else
+         (when (or (<= kind 2) (= kind 10) (= kind 11))
+           (focus-terminal! direction))
+         (when (or (= kind 10) (= kind 11))
+           (scroll-active-terminal! group kind))
+         (helix.redraw)])
      event-result/consume]))
 
 ;; Reconstruct the visible text of one terminal row. Cells are one column

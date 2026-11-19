@@ -467,6 +467,26 @@ impl VTerm {
         self.current().map(|cell| cell.attrs as isize).unwrap_or(0)
     }
 
+    fn render_cells(&mut self) -> Vec<FFIValue> {
+        self.refresh();
+
+        let cols = self.cols.max(1) as usize;
+        let mut result = Vec::new();
+        for (index, cell) in self.cells.iter().enumerate() {
+            if cell.text.is_empty() {
+                continue;
+            }
+
+            result.push(FFIValue::IntV((index % cols) as isize));
+            result.push(FFIValue::IntV((index / cols) as isize));
+            result.push(FFIValue::IntV(cell.fg));
+            result.push(FFIValue::IntV(cell.bg));
+            result.push(FFIValue::IntV(cell.attrs as isize));
+            result.push(cell.text.clone().into());
+        }
+        result
+    }
+
     fn current(&self) -> Option<&CellData> {
         self.iter.and_then(|index| self.cells.get(index))
     }
@@ -481,6 +501,13 @@ impl VTerm {
 
     fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    fn scroll_offset(&self) -> isize {
+        self.term
+            .scrollbar()
+            .map(|scrollbar| scrollbar.offset as isize)
+            .unwrap_or(0)
     }
 
     fn scroll_up(&mut self, amount: isize) {
@@ -539,9 +566,11 @@ fn create_module() -> FFIModule {
         .register_fn("vte/iter-cell-fg", VTerm::iter_cell_fg)
         .register_fn("vte/iter-cell-bg", VTerm::iter_cell_bg)
         .register_fn("vte/iter-cell-attrs", VTerm::iter_cell_attrs)
+        .register_fn("vte/render-cells", VTerm::render_cells)
         .register_fn("vte/cursor-x", VTerm::cursor_x)
         .register_fn("vte/cursor-y", VTerm::cursor_y)
         .register_fn("vte/cursor-visible?", VTerm::cursor_visible)
+        .register_fn("vte/scroll-offset", VTerm::scroll_offset)
         .register_fn("vte/scroll-up", VTerm::scroll_up)
         .register_fn("vte/scroll-down", VTerm::scroll_down)
         .register_fn("vte/scroll-top", VTerm::scroll_top)
