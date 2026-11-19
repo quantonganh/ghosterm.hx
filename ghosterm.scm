@@ -55,6 +55,11 @@
 ;; #f means "30% of the current editor width", recomputed on every render.
 (define *terminal-width* #f)
 
+;; Float pane size specs. #f means "90% of the editor", "<n>%" is a
+;; percentage, and "<n>" is an absolute number of cells.
+(define *float-width* #f)
+(define *float-height* #f)
+
 (define (default-terminal-height)
   (let ([area (editor-focused-buffer-area)])
     (if area
@@ -63,10 +68,35 @@
 
 (define (terminal . args)
   (define direction (direction-argument args 'bottom))
-  (if (null? (command-arguments args))
-      (show-terminal direction)
-      (terminal-exec-in direction
-                        (terminal-exec-command (command-arguments args)))))
+  (define rest (command-arguments args))
+  (if (eq? direction 'float)
+      (let* ([options (parse-size-options rest)]
+             [width (list-ref options 0)]
+             [height (list-ref options 1)]
+             [command-args (list-ref options 2)])
+        (when width (set! *float-width* width))
+        (when height (set! *float-height* height))
+        (if (null? command-args)
+            (show-terminal direction)
+            (terminal-exec-in direction
+                              (terminal-exec-command command-args))))
+      (if (null? rest)
+          (show-terminal direction)
+          (terminal-exec-in direction (terminal-exec-command rest)))))
+
+(define (parse-size-options args)
+  (let loop ([args args] [width #f] [height #f])
+    (cond
+      [(null? args) (list width height '())]
+      [(equal? (car args) "-w")
+       (if (null? (cdr args))
+           (list width height args)
+           (loop (cddr args) (cadr args) height))]
+      [(equal? (car args) "-h")
+       (if (null? (cdr args))
+           (list width height args)
+           (loop (cddr args) width (cadr args)))]
+      [else (list width height args)])))
 
 (define (terminal-toggle . args)
   (toggle-terminal (direction-argument args (terminal-default-direction))))
@@ -579,8 +609,8 @@
   (define max-height (- total-height 2))
   (if (or (< max-width 3) (< max-height 3))
       #f
-      (let* ([width (min max-width (max 20 (quotient (* total-width 9) 10)))]
-             [height (min max-height (max 5 (quotient (* total-height 9) 10)))]
+      (let* ([width (resolve-size *float-width* total-width max-width 20 90)]
+             [height (resolve-size *float-height* total-height max-height 5 90)]
              [stagger (min index 5)]
              [x (+ (area-x rect)
                    (quotient (- total-width width) 2)
@@ -592,6 +622,29 @@
               (min y (+ (area-y rect) (- total-height height)))
               width
               height))))
+
+(define (resolve-size spec total max-size min-size default-percent)
+  (define parsed (parse-size-spec spec))
+  (define value
+    (cond
+      [(not parsed) (percent-of total default-percent)]
+      [(eq? (car parsed) 'percent) (percent-of total (cdr parsed))]
+      [else (cdr parsed)]))
+  (min max-size (max min-size value)))
+
+(define (percent-of total percent)
+  (inexact->exact (floor (/ (* total percent) 100))))
+
+(define (parse-size-spec spec)
+  (and spec
+       (let* ([len (string-length spec)]
+              [percent? (and (> len 0)
+                             (char=? (string-ref spec (- len 1)) #\%))]
+              [digits (if percent? (substring spec 0 (- len 1)) spec)]
+              [value (string->number digits)])
+         (and value
+              (cons (if percent? 'percent 'cells)
+                    (inexact->exact (truncate value)))))))
 
 (define (render-float-terminal group state rect frame)
   (define tabs (terminal-tabs-list group))
@@ -1131,11 +1184,18 @@
        (< (event-mouse-row event) (+ (area-y pane) (area-height pane)))))
 
 (define (float-tab-index-at-click group event)
-  (let loop ([tabs (terminal-tabs-list group)] [i 0])
+  (define tabs (terminal-tabs-list group))
+  (define active (terminal-tabs-active-index group))
+  (define count (length tabs))
+  (define (try i)
     (cond
-      [(null? tabs) #f]
-      [(mouse-inside-terminal? (car tabs) event) i]
-      [else (loop (cdr tabs) (+ i 1))])))
+      [(< i 0) #f]
+      [(= i active) (try (- i 1))]
+      [(mouse-inside-terminal? (list-ref tabs i) event) i]
+      [else (try (- i 1))]))
+  (cond
+    [(mouse-inside-terminal? (list-ref tabs active) event) active]
+    [else (try (- count 1))]))
 
 (define (handle-mouse-event group event)
   (define direction (TerminalTabs-direction group))
