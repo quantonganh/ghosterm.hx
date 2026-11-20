@@ -1343,6 +1343,10 @@
     [(copy-mode-active? state)
      (handle-copy-mode-key state event)]
 
+    [(and (or (key-event-backspace? event) (key-event-delete? event))
+          (ghost-bit? mods 2))
+     (pty-write pty "\x1b;\x7f;")]
+
     [(key-event-backspace? event) (pty-write-char pty (integer->char 127))]
     [(key-event-enter? event) (pty-write pty "\r")]
     [(key-event-tab? event)
