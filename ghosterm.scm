@@ -242,6 +242,10 @@
          (modulo (+ (terminal-tabs-active-index group) delta) count))))))
 
 (define (show-terminal direction)
+  (when (and (not (eq? direction 'float))
+             (terminal-visible? 'float))
+    (hide-terminal 'float))
+
   (define group (terminal-get direction))
 
   (unless group
@@ -860,6 +864,20 @@
   (define selected-tab
     (and tabs? (key-event? event) (terminal-select-tab-index event)))
   (cond
+     [(and (key-event? event)
+           (terminal-toggle-trigger? event))
+      (toggle-terminal 'bottom)
+      event-result/consume]
+
+
+    [(terminal-toggle-right-trigger? event)
+     (toggle-terminal 'right)
+     event-result/consume]
+
+    [(terminal-toggle-float-trigger? event)
+     (toggle-terminal 'float)
+     event-result/consume]
+
     [(not (and state (unbox (Terminal-active state))))
      event-result/ignore]
 
@@ -891,12 +909,8 @@
      (switch-terminal-tab! direction selected-tab)
      event-result/consume]
 
-    [(and (key-event? event)
-          (terminal-toggle-trigger? event))
-     (toggle-terminal direction)
-     event-result/consume]
+     ;; Ctrl-D: close the active tab (and the pane when it was the last).
 
-    ;; Ctrl-D: close the active tab (and the pane when it was the last).
     [(and (key-event? event)
           (let ([c (key-event-char event)])
              (and c
@@ -948,6 +962,65 @@
             (and (ghost-bit? mods 1)
                  (or (char=? c #\7)
                      (char=? c #\/)))))))
+
+(define (terminal-ctrl-key-code? event code)
+  (and (key-event? event)
+       (let ([mods (or (key-event-modifier event) 0)]
+             [actual (key-event-char event)])
+         (and actual
+              (ghost-bit? mods 1)
+              (= (char->integer actual) code)))))
+
+(define (terminal-toggle-right-trigger? event)
+  (or (terminal-ctrl-key-code? event (char->integer #\]))
+      (terminal-ctrl-key-code? event (char->integer #\5))
+      (terminal-ctrl-key-code? event 29)))
+
+(define (terminal-editor-apostrophe-trigger? event)
+  (and (key-event? event)
+       (or (and (not *focused-direction*)
+                (equal? (editor-mode) "normal"))
+           (and *focused-direction*
+                (terminal-visible? *focused-direction*)))
+       (let ([mods (or (key-event-modifier event) 0)]
+             [actual (key-event-char event)])
+         (and actual
+              (= mods 0)
+              (= (char->integer actual) 39)))))
+
+(define (terminal-toggle-float-trigger? event)
+  (or (terminal-ctrl-key-code? event (char->integer #\'))
+      (terminal-ctrl-key-code? event 39)
+      (terminal-editor-apostrophe-trigger? event)))
+
+(define (terminal-global-key-handler _ event)
+  (cond
+    [(terminal-toggle-trigger? event)
+     (toggle-terminal 'bottom)
+     event-result/consume]
+
+    [(terminal-toggle-right-trigger? event)
+     (toggle-terminal 'right)
+     event-result/consume]
+
+    [(terminal-toggle-float-trigger? event)
+     (toggle-terminal 'float)
+     event-result/consume]
+
+    [else event-result/ignore]))
+
+(define *global-keys-installed?* #f)
+
+(define (install-global-keys!)
+  (unless *global-keys-installed?*
+    (set! *global-keys-installed?* #t)
+    (push-component!
+     (new-component! "ghosterm-global-keys"
+                     #f
+                     #f
+                     (hash-insert (hash)
+                                  "handle_event"
+                                  terminal-global-key-handler)))))
 
 (define (terminal-focus-editor-trigger? event)
   (let ([mods (or (key-event-modifier event) 0)]
@@ -1554,6 +1627,8 @@
              [token (token-under-click line cell-x)])
         (when token
           (let ([location (location-at-token token)])
-            (when location
-              (helix.open location)
-              (blur-terminal!))))))))
+             (when location
+               (helix.open location)
+               (blur-terminal!))))))))
+
+(install-global-keys!)
