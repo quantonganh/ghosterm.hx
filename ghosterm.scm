@@ -41,7 +41,8 @@
          terminal-focus
          terminal-run
          terminal-run-config
-         terminal-toggle)
+         terminal-toggle
+         terminal-copy-mode)
 
 (define *terminal-shell* (default-shell))
 
@@ -103,6 +104,14 @@
 
 (define (terminal-toggle . args)
   (toggle-terminal (direction-argument args (terminal-default-direction))))
+
+(define (terminal-copy-mode . args)
+  (define direction (direction-argument args (terminal-default-direction)))
+  (define state (terminal-active-term direction))
+  (when (and state (unbox (Terminal-active state)))
+    (if (copy-mode-active? state)
+        (exit-copy-mode! state #t)
+        (enter-copy-mode! state))))
 
 (define (direction-name direction)
   (cond
@@ -382,8 +391,10 @@
     (helix.redraw)))
 
 (struct Terminal
-         (direction cursor pty vte size focused? active kill-switch area
-               cursor-shown? selection))
+          (direction cursor pty vte size focused? active kill-switch area
+                cursor-shown? selection copy-mode? copy-cursor copy-anchor
+                copy-selection-mode))
+
 
 (define (make-terminal direction shell rows cols)
   (define pty (create-pty shell rows cols))
@@ -392,13 +403,19 @@
             (position 0 0)
             pty
             vt
-            (box #f)
-            (box #f)
-            (box #f)
-            (box #f)
-            (box #f)
-            (box #f)
-            (box #f)))
+             (box #f)
+             (box #f)
+             (box #f)
+             (box #f)
+             (box #f)
+              (box #f)
+              (box #f)
+              (box #f)
+              (position 0 0)
+              (position 0 0)
+              (box 'none)))
+
+
 
 (define (terminal-loop term)
   (define pty (Terminal-pty term))
@@ -410,9 +427,10 @@
        (pty-read pty)
        (lambda (bytes)
           (cond
-            [bytes
-             (set-box! (Terminal-selection term) #f)
-             (vte/advance-bytes vt bytes)
+             [bytes
+              (reset-copy-mode! term)
+              (vte/advance-bytes vt bytes)
+
              (terminal-loop term)]
             [(pty-alive? pty)
              (terminal-loop term)]
@@ -440,6 +458,21 @@
           [else (render-bottom-terminal group state rect frame)])
         (set-editor-clip! direction 0))))
 
+(define (terminal-display-cursor state vt rows cols)
+  (if (unbox (Terminal-copy-mode? state))
+      (let* ([cursor (Terminal-copy-cursor state)]
+             [x (position-col cursor)]
+             [y (position-row cursor)])
+        (and (>= x 0) (< x cols)
+             (>= y 0) (< y rows)
+             (list x y)))
+      (let ([x (vte/cursor-x vt)]
+            [y (vte/cursor-y vt)])
+        (and (vte/cursor-visible? vt)
+             (>= x 0) (< x cols)
+             (>= y 0) (< y rows)
+             (list x y)))))
+
 (define (render-bottom-terminal group state rect frame)
   (define pane (terminal-pane-area rect))
 
@@ -463,9 +496,10 @@
      ;; Resize only when dimensions change.
      (define target-size (list text-rows cols))
      (unless (equal? (unbox (Terminal-size state)) target-size)
-       (set-box! (Terminal-size state) target-size)
-       (set-box! (Terminal-selection state) #f)
-       (vte/resize vt text-rows cols)
+        (set-box! (Terminal-size state) target-size)
+        (reset-copy-mode! state)
+        (vte/resize vt text-rows cols)
+
        (pty-resize pty text-rows cols))
 
      (define theme-fg
@@ -493,23 +527,14 @@
                                (unbox (Terminal-selection state)))
 
 
-     (define cursor (Terminal-cursor state))
-     (define cursor-y (vte/cursor-y vt))
-     (define cursor-x (vte/cursor-x vt))
-     ;; After scrolling the viewport the terminal cursor can be outside the
-     ;; visible rows, in which case its coordinates are negative. Passing
-     ;; those through would wrap to 65535 and panic the terminal backend.
-     (define cursor-shown?
-       (and focused
-            (vte/cursor-visible? vt)
-             (>= cursor-y 0)
-             (< cursor-y text-rows)
-             (>= cursor-x 0)
-             (< cursor-x cols)))
-     (set-box! (Terminal-cursor-shown? state) cursor-shown?)
-     (when cursor-shown?
-       (set-position-row! cursor (+ y-offset cursor-y))
-       (set-position-col! cursor (+ x-offset cursor-x)))]))
+      (define cursor (Terminal-cursor state))
+      (define cursor-pos (terminal-display-cursor state vt text-rows cols))
+      (define cursor-shown? (and focused cursor-pos))
+      (set-box! (Terminal-cursor-shown? state) cursor-shown?)
+      (when cursor-shown?
+        (set-position-row! cursor (+ y-offset (car (cdr cursor-pos))))
+        (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
+
 
 (define (tab-label index)
   (string-append " " (number->string (+ index 1)) " "))
@@ -570,9 +595,10 @@
 
      (define target-size (list text-rows text-cols))
      (unless (equal? (unbox (Terminal-size state)) target-size)
-       (set-box! (Terminal-size state) target-size)
-       (set-box! (Terminal-selection state) #f)
-       (vte/resize vt text-rows text-cols)
+        (set-box! (Terminal-size state) target-size)
+        (reset-copy-mode! state)
+        (vte/resize vt text-rows text-cols)
+
        (pty-resize pty text-rows text-cols))
 
      (define theme-fg
@@ -598,20 +624,14 @@
                                (unbox (Terminal-selection state)))
 
 
-     (define cursor (Terminal-cursor state))
-     (define cursor-y (vte/cursor-y vt))
-     (define cursor-x (vte/cursor-x vt))
-(define cursor-shown?
-        (and focused
-             (vte/cursor-visible? vt)
-             (>= cursor-y 0)
-             (< cursor-y text-rows)
-             (>= cursor-x 0)
-             (< cursor-x text-cols)))
+      (define cursor (Terminal-cursor state))
+      (define cursor-pos (terminal-display-cursor state vt text-rows text-cols))
+      (define cursor-shown? (and focused cursor-pos))
       (set-box! (Terminal-cursor-shown? state) cursor-shown?)
       (when cursor-shown?
-        (set-position-row! cursor (+ y-offset cursor-y))
-        (set-position-col! cursor (+ x-offset cursor-x)))]))
+        (set-position-row! cursor (+ y-offset (car (cdr cursor-pos))))
+        (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
+
 
 (define (float-pane-area rect index)
   (define total-width (area-width rect))
@@ -687,9 +707,10 @@
 
      (define target-size (list text-rows text-cols))
      (unless (equal? (unbox (Terminal-size term)) target-size)
-       (set-box! (Terminal-size term) target-size)
-       (set-box! (Terminal-selection term) #f)
-       (vte/resize vt text-rows text-cols)
+        (set-box! (Terminal-size term) target-size)
+        (reset-copy-mode! term)
+        (vte/resize vt text-rows text-cols)
+
        (pty-resize pty text-rows text-cols))
 
      (define theme-fg
@@ -715,20 +736,14 @@
                                (unbox (Terminal-selection term)))
 
 
-      (define cursor (Terminal-cursor term))
-     (define cursor-y (vte/cursor-y vt))
-     (define cursor-x (vte/cursor-x vt))
-     (define cursor-shown?
-       (and focused
-            (vte/cursor-visible? vt)
-            (>= cursor-y 0)
-            (< cursor-y text-rows)
-            (>= cursor-x 0)
-            (< cursor-x text-cols)))
-     (set-box! (Terminal-cursor-shown? term) cursor-shown?)
-     (when cursor-shown?
-       (set-position-row! cursor (+ y-offset cursor-y))
-       (set-position-col! cursor (+ x-offset cursor-x)))]))
+       (define cursor (Terminal-cursor term))
+      (define cursor-pos (terminal-display-cursor term vt text-rows text-cols))
+      (define cursor-shown? (and focused cursor-pos))
+      (set-box! (Terminal-cursor-shown? term) cursor-shown?)
+      (when cursor-shown?
+        (set-position-row! cursor (+ y-offset (car (cdr cursor-pos))))
+        (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
+
 
 (define (render-run! frame x-offset y-offset theme-fg theme-bg
                      x y fg bg attrs text selected)
@@ -890,10 +905,18 @@
      (terminal-cycle)
      event-result/consume]
 
-    [(not (unbox (Terminal-focused? state)))
-     event-result/ignore]
+     [(not (unbox (Terminal-focused? state)))
+      event-result/ignore]
 
-    [(and tabs? (terminal-new-tab-trigger? event))
+     [(and (key-event? event)
+           (terminal-copy-mode-trigger? event))
+      (if (copy-mode-active? state)
+          (exit-copy-mode! state #t)
+          (enter-copy-mode! state))
+      event-result/consume]
+
+     [(and tabs? (terminal-new-tab-trigger? event))
+
      (new-terminal-tab direction)
      event-result/consume]
 
@@ -911,12 +934,14 @@
 
      ;; Ctrl-D: close the active tab (and the pane when it was the last).
 
-    [(and (key-event? event)
-          (let ([c (key-event-char event)])
-             (and c
-                  (char=? c #\d)
-                  (ghost-bit? (or (key-event-modifier event) 0) 1)
-                  (pty-foreground-shell? (Terminal-pty state)))))
+     [(and (key-event? event)
+           (not (copy-mode-active? state))
+           (let ([c (key-event-char event)])
+              (and c
+                   (char=? c #\d)
+                   (ghost-bit? (or (key-event-modifier event) 0) 1)
+                   (pty-foreground-shell? (Terminal-pty state)))))
+
       (close-terminal-tab direction)
      event-result/consume]
 
@@ -1022,6 +1047,15 @@
                                   "handle_event"
                                   terminal-global-key-handler)))))
 
+(define (terminal-copy-mode-trigger? event)
+  (and (key-event? event)
+       (let ([mods (or (key-event-modifier event) 0)]
+             [c (key-event-char event)])
+         (and c
+              (ghost-bit? mods 1)
+              (or (char=? c #\x)
+                  (char=? c #\X))))))
+
 (define (terminal-focus-editor-trigger? event)
   (let ([mods (or (key-event-modifier event) 0)]
         [c (key-event-char event)])
@@ -1040,12 +1074,275 @@
       (Terminal-cursor state)
       #f))
 
+(define (copy-mode-active? state)
+  (unbox (Terminal-copy-mode? state)))
+
+(define (reset-copy-mode! state)
+  (set-box! (Terminal-copy-mode? state) #f)
+  (set-box! (Terminal-copy-selection-mode state) 'none)
+  (set-box! (Terminal-selection state) #f))
+
+(define (copy-mode-limit value high)
+  (min (max 0 high) (max 0 value)))
+
+(define (copy-mode-size state)
+  (or (unbox (Terminal-size state)) (list 24 80)))
+
+(define (copy-mode-position state)
+  (define cursor (Terminal-copy-cursor state))
+  (list (position-col cursor) (position-row cursor)))
+
+(define (sync-copy-selection! state)
+  (define mode (unbox (Terminal-copy-selection-mode state)))
+  (cond
+    [(eq? mode 'cell)
+     (let* ([anchor (Terminal-copy-anchor state)]
+            [cursor (Terminal-copy-cursor state)]
+            [ax (position-col anchor)]
+            [ay (position-row anchor)]
+            [cx (position-col cursor)]
+            [cy (position-row cursor)])
+       (set-box! (Terminal-selection state)
+                 (cond
+                   [(< cy ay) (list cx cy ax ay)]
+                   [(and (= cy ay) (< cx ax)) (list cx cy ax ay)]
+                   [else (list ax ay cx cy)])))]
+    [(eq? mode 'line)
+     (let* ([anchor (Terminal-copy-anchor state)]
+            [cursor (Terminal-copy-cursor state)]
+            [cols (car (cdr (copy-mode-size state)))]
+            [ay (position-row anchor)]
+            [cy (position-row cursor)])
+       (set-box! (Terminal-selection state)
+                 (list 0 (min ay cy) cols (max ay cy))))]
+    [else
+     (set-box! (Terminal-selection state) #f)]))
+
+(define (set-copy-mode-position! state x y)
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (define cols (car (cdr size)))
+  (define cursor (Terminal-copy-cursor state))
+  (set-position-col! cursor (copy-mode-limit x (- cols 1)))
+  (set-position-row! cursor (copy-mode-limit y (- rows 1)))
+  (sync-copy-selection! state))
+
+(define (enter-copy-mode! state)
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (define cols (car (cdr size)))
+  (define vt (Terminal-vte state))
+  (define anchor (Terminal-copy-anchor state))
+  (set-position-col! anchor (copy-mode-limit (vte/cursor-x vt) (- cols 1)))
+  (set-position-row! anchor (copy-mode-limit (vte/cursor-y vt) (- rows 1)))
+  (set-box! (Terminal-copy-mode? state) #t)
+  (set-box! (Terminal-copy-selection-mode state) 'none)
+  (set-box! (Terminal-selection state) #f)
+  (set-copy-mode-position! state (position-col anchor) (position-row anchor))
+  (set-status! "Copy mode: h/j/k/l move, v select, y copy, Esc exit")
+  (helix.redraw))
+
+(define (exit-copy-mode! state scroll-bottom?)
+  (when scroll-bottom?
+    (vte/scroll-bottom (Terminal-vte state)))
+  (reset-copy-mode! state)
+  (helix.redraw))
+
+(define (start-copy-selection! state mode)
+  (define cursor (Terminal-copy-cursor state))
+  (define anchor (Terminal-copy-anchor state))
+  (define current (unbox (Terminal-copy-selection-mode state)))
+  (define next (if (eq? current mode) 'none mode))
+  (set-position-col! anchor (position-col cursor))
+  (set-position-row! anchor (position-row cursor))
+  (set-box! (Terminal-copy-selection-mode state) next)
+  (sync-copy-selection! state))
+
+(define (swap-copy-ends! state)
+  (define cursor (Terminal-copy-cursor state))
+  (define anchor (Terminal-copy-anchor state))
+  (define cx (position-col cursor))
+  (define cy (position-row cursor))
+  (set-position-col! cursor (position-col anchor))
+  (set-position-row! cursor (position-row anchor))
+  (set-position-col! anchor cx)
+  (set-position-row! anchor cy)
+  (sync-copy-selection! state))
+
+(define (shift-copy-positions-y! state delta)
+  (unless (= delta 0)
+    (define size (copy-mode-size state))
+    (define rows (car size))
+    (define cursor (Terminal-copy-cursor state))
+    (define anchor (Terminal-copy-anchor state))
+    (set-position-row! cursor (copy-mode-limit (+ (position-row cursor) delta) (- rows 1)))
+    (set-position-row! anchor (copy-mode-limit (+ (position-row anchor) delta) (- rows 1)))
+    (sync-copy-selection! state)))
+
+(define (copy-mode-scroll! state amount)
+  (unless (= amount 0)
+    (define vt (Terminal-vte state))
+    (define before (vte/scroll-offset vt))
+    (if (> amount 0)
+        (vte/scroll-down vt amount)
+        (vte/scroll-up vt (- amount)))
+    (shift-copy-positions-y! state (- before (vte/scroll-offset vt)))))
+
+(define (copy-mode-scroll-edge! state top?)
+  (define vt (Terminal-vte state))
+  (define before (vte/scroll-offset vt))
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (if top?
+      (begin
+        (vte/scroll-top vt)
+        (shift-copy-positions-y! state (- before (vte/scroll-offset vt)))
+        (set-copy-mode-position! state (car (copy-mode-position state)) 0))
+      (begin
+        (vte/scroll-bottom vt)
+        (shift-copy-positions-y! state (- before (vte/scroll-offset vt)))
+        (set-copy-mode-position! state
+                                 (car (copy-mode-position state))
+                                 (- rows 1)))))
+
+(define (copy-mode-line-text state y)
+  (define cols (car (cdr (copy-mode-size state))))
+  (terminal-row-text (Terminal-vte state) y cols))
+
+(define (line-first-nonspace line cols)
+  (let loop ([i 0])
+    (cond
+      [(>= i cols) 0]
+      [(char-whitespace? (string-ref line i)) (loop (+ i 1))]
+      [else i])))
+
+(define (line-last-nonspace line cols)
+  (let loop ([i (- cols 1)])
+    (cond
+      [(< i 0) #f]
+      [(char-whitespace? (string-ref line i)) (loop (- i 1))]
+      [else i])))
+
+(define (line-word-end line from cols)
+  (let loop ([i from] [last #f])
+    (cond
+      [(>= i cols) last]
+      [(char-whitespace? (string-ref line i))
+       (if last last (loop (+ i 1) #f))]
+      [else (loop (+ i 1) i)])))
+
+(define (copy-mode-forward-word! state)
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (define cols (car (cdr size)))
+  (define pos (copy-mode-position state))
+  (let loop ([x (+ (car pos) 1)] [y (car (cdr pos))])
+    (cond
+      [(>= y rows) (set-copy-mode-position! state (- cols 1) (- rows 1))]
+      [(>= x cols) (loop 0 (+ y 1))]
+      [(char-whitespace? (string-ref (copy-mode-line-text state y) x))
+       (loop (+ x 1) y)]
+      [else (set-copy-mode-position! state x y)])))
+
+(define (copy-mode-backward-word! state)
+  (define size (copy-mode-size state))
+  (define cols (car (cdr size)))
+  (define pos (copy-mode-position state))
+  (let loop ([x (- (car pos) 1)] [y (car (cdr pos))])
+    (cond
+      [(< y 0) (set-copy-mode-position! state 0 0)]
+      [(< x 0) (loop (- cols 1) (- y 1))]
+      [(char-whitespace? (string-ref (copy-mode-line-text state y) x))
+       (loop (- x 1) y)]
+      [else (set-copy-mode-position! state x y)])))
+
+(define (copy-mode-word-end! state)
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (define cols (car (cdr size)))
+  (define pos (copy-mode-position state))
+  (let loop ([x (car pos)] [y (car (cdr pos))])
+    (cond
+      [(>= y rows) (set-copy-mode-position! state (- cols 1) (- rows 1))]
+      [else
+       (let ([end (line-word-end (copy-mode-line-text state y) x cols)])
+         (if end
+             (set-copy-mode-position! state end y)
+             (loop 0 (+ y 1))))])))
+
+(define (copy-mode-yank! state)
+  (define selection (unbox (Terminal-selection state)))
+  (when (or (not selection) (selection-empty? selection))
+    (let* ([cursor (Terminal-copy-cursor state)]
+           [anchor (Terminal-copy-anchor state)])
+      (set-position-col! anchor (position-col cursor))
+      (set-position-row! anchor (position-row cursor))
+      (set-box! (Terminal-copy-selection-mode state) 'line)
+      (sync-copy-selection! state)))
+  (copy-selection! state)
+  (exit-copy-mode! state #t))
+
+(define (handle-copy-mode-key state event)
+  (define c (key-event-char event))
+  (define mods (or (key-event-modifier event) 0))
+  (define size (copy-mode-size state))
+  (define rows (car size))
+  (define cols (car (cdr size)))
+  (define pos (copy-mode-position state))
+  (define x (car pos))
+  (define y (car (cdr pos)))
+  (define ctrl? (ghost-bit? mods 1))
+  (define (plain ch)
+    (and c
+         (or (= mods 0) (= mods 1))
+         (char=? c ch)))
+  (define (ctrl ch)
+    (and c ctrl? (char=? c ch)))
+  (cond
+    [(key-event-escape? event) (exit-copy-mode! state #t)]
+    [(plain #\q) (exit-copy-mode! state #t)]
+    [(plain #\y) (copy-mode-yank! state)]
+    [(plain #\v) (start-copy-selection! state 'cell)]
+    [(plain #\V) (start-copy-selection! state 'line)]
+    [(ctrl #\v) (start-copy-selection! state 'cell)]
+    [(plain #\o) (swap-copy-ends! state)]
+    [(or (plain #\h) (key-event-left? event)) (set-copy-mode-position! state (- x 1) y)]
+    [(or (plain #\l) (key-event-right? event)) (set-copy-mode-position! state (+ x 1) y)]
+    [(or (plain #\k) (key-event-up? event)) (set-copy-mode-position! state x (- y 1))]
+    [(or (plain #\j) (key-event-down? event)) (set-copy-mode-position! state x (+ y 1))]
+    [(plain #\w) (copy-mode-forward-word! state)]
+    [(plain #\b) (copy-mode-backward-word! state)]
+    [(plain #\e) (copy-mode-word-end! state)]
+    [(plain #\0) (set-copy-mode-position! state 0 y)]
+    [(plain #\^)
+     (set-copy-mode-position!
+      state
+      (line-first-nonspace (copy-mode-line-text state y) cols)
+      y)]
+    [(or (plain #\$) (key-event-end? event))
+     (let ([end (line-last-nonspace (copy-mode-line-text state y) cols)])
+       (set-copy-mode-position! state (or end (- cols 1)) y))]
+    [(key-event-home? event) (set-copy-mode-position! state 0 y)]
+    [(key-event-enter? event) (set-copy-mode-position! state 0 (+ y 1))]
+    [(plain #\g) (copy-mode-scroll-edge! state #t)]
+    [(plain #\G) (copy-mode-scroll-edge! state #f)]
+    [(key-event-page-up? event) (copy-mode-scroll! state (- (max 1 (quotient rows 2))))]
+    [(key-event-page-down? event) (copy-mode-scroll! state (max 1 (quotient rows 2)))]
+    [(ctrl #\b) (copy-mode-scroll! state (- (max 1 (quotient rows 2))))]
+    [(ctrl #\f) (copy-mode-scroll! state (max 1 (quotient rows 2)))]
+    [(ctrl #\u) (copy-mode-scroll! state (- (max 1 (quotient rows 4))))]
+    [(ctrl #\d) (copy-mode-scroll! state (max 1 (quotient rows 4)))]
+    [else void]))
+
 (define (handle-key-event state event)
   (define pty (Terminal-pty state))
   (define mods (or (key-event-modifier event) 0))
   (define c (key-event-char event))
 
   (cond
+    [(copy-mode-active? state)
+     (handle-copy-mode-key state event)]
+
     [(key-event-backspace? event) (pty-write-char pty (integer->char 127))]
     [(key-event-enter? event) (pty-write pty "\r")]
     [(key-event-tab? event)
@@ -1150,6 +1447,7 @@
     (define was-focused? (unbox (Terminal-focused? term)))
     (set-box! (Terminal-focused? term) #f)
     (set-box! (Terminal-active term) #f)
+    (reset-copy-mode! term)
     (when was-focused?
       (when (eq? *focused-direction* direction)
         (set! *focused-direction* #f))
