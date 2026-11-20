@@ -722,12 +722,13 @@
        (if focused border-base (style-with-dim border-base)))
 
      (buffer/clear frame pane)
-     (block/render frame
-                   pane
-                   (make-block (theme->bg *helix.cx*)
-                               border-style
-                               "all"
-                               "plain"))
+      (block/render frame
+              pane
+              (make-block (theme->bg *helix.cx*)
+                          border-style
+                          "all"
+                          "rounded"))
+
 
       (define x-offset (+ (area-x pane) 1))
       (define y-offset (+ (area-y pane) 1))
