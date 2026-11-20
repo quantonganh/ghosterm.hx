@@ -25,6 +25,7 @@ const ATTR_INVISIBLE: u16 = 1 << 5;
 const ATTR_STRIKETHROUGH: u16 = 1 << 6;
 const ATTR_OVERLINE: u16 = 1 << 7;
 const ATTR_UNDERLINE: u16 = 1 << 8;
+const SELECTION_BIAS: isize = 1_000_000;
 
 fn to_rbox(err: impl std::fmt::Display) -> RBoxError {
     RBoxError::new(std::io::Error::other(err.to_string()))
@@ -467,22 +468,83 @@ impl VTerm {
         self.current().map(|cell| cell.attrs as isize).unwrap_or(0)
     }
 
-    fn render_cells(&mut self) -> Vec<FFIValue> {
+    fn selection_contains(x: isize, y: isize, x1: isize, y1: isize, x2: isize, y2: isize) -> bool {
+        if y < y1 || y > y2 {
+            return false;
+        }
+        if y1 == y2 {
+            x >= x1 && x < x2
+        } else if y == y1 {
+            x >= x1
+        } else if y == y2 {
+            x < x2
+        } else {
+            true
+        }
+    }
+
+    fn render_runs(
+        &mut self,
+        has_selection: bool,
+        x1: usize,
+        y1: usize,
+        x2: usize,
+        y2: usize,
+    ) -> Vec<FFIValue> {
         self.refresh();
 
+        let x1 = x1 as isize - SELECTION_BIAS;
+        let y1 = y1 as isize - SELECTION_BIAS;
+        let x2 = x2 as isize - SELECTION_BIAS;
+        let y2 = y2 as isize - SELECTION_BIAS;
         let cols = self.cols.max(1) as usize;
-        let mut result = Vec::new();
+        let mut runs: Vec<(usize, usize, isize, isize, u16, String, bool, usize)> = Vec::new();
+
         for (index, cell) in self.cells.iter().enumerate() {
             if cell.text.is_empty() {
                 continue;
             }
 
-            result.push(FFIValue::IntV((index % cols) as isize));
-            result.push(FFIValue::IntV((index / cols) as isize));
-            result.push(FFIValue::IntV(cell.fg));
-            result.push(FFIValue::IntV(cell.bg));
-            result.push(FFIValue::IntV(cell.attrs as isize));
-            result.push(cell.text.clone().into());
+            let x = index % cols;
+            let y = index / cols;
+            let selected =
+                has_selection && Self::selection_contains(x as isize, y as isize, x1, y1, x2, y2);
+
+            if let Some(last) = runs.last_mut() {
+                if last.1 == y
+                    && last.0 + last.7 == x
+                    && last.2 == cell.fg
+                    && last.3 == cell.bg
+                    && last.4 == cell.attrs
+                    && last.6 == selected
+                {
+                    last.5.push_str(&cell.text);
+                    last.7 += 1;
+                    continue;
+                }
+            }
+
+            runs.push((
+                x,
+                y,
+                cell.fg,
+                cell.bg,
+                cell.attrs,
+                cell.text.clone(),
+                selected,
+                1,
+            ));
+        }
+
+        let mut result = Vec::with_capacity(runs.len() * 7);
+        for (x, y, fg, bg, attrs, text, selected, _) in runs {
+            result.push(FFIValue::IntV(x as isize));
+            result.push(FFIValue::IntV(y as isize));
+            result.push(FFIValue::IntV(fg));
+            result.push(FFIValue::IntV(bg));
+            result.push(FFIValue::IntV(attrs as isize));
+            result.push(text.into());
+            result.push(FFIValue::IntV(if selected { 1 } else { 0 }));
         }
         result
     }
@@ -566,7 +628,7 @@ fn create_module() -> FFIModule {
         .register_fn("vte/iter-cell-fg", VTerm::iter_cell_fg)
         .register_fn("vte/iter-cell-bg", VTerm::iter_cell_bg)
         .register_fn("vte/iter-cell-attrs", VTerm::iter_cell_attrs)
-        .register_fn("vte/render-cells", VTerm::render_cells)
+        .register_fn("vte/render-runs", VTerm::render_runs)
         .register_fn("vte/cursor-x", VTerm::cursor_x)
         .register_fn("vte/cursor-y", VTerm::cursor_y)
         .register_fn("vte/cursor-visible?", VTerm::cursor_visible)

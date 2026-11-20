@@ -25,7 +25,7 @@
                           vte/iter-cell-fg
                           vte/iter-cell-bg
                           vte/iter-cell-attrs
-                          vte/render-cells
+                          vte/render-runs
                           vte/cursor-x
                           vte/cursor-y
                           vte/cursor-visible?
@@ -725,68 +725,49 @@
        (set-position-row! cursor (+ y-offset cursor-y))
        (set-position-col! cursor (+ x-offset cursor-x)))]))
 
-(define (render-cell-group? group cell)
-  (and (= (list-ref cell 0)
-          (+ (list-ref group 0) (list-ref group 7)))
-       (= (list-ref cell 1) (list-ref group 1))
-       (= (list-ref cell 2) (list-ref group 2))
-       (= (list-ref cell 3) (list-ref group 3))
-       (= (list-ref cell 4) (list-ref group 4))
-       (eq? (list-ref cell 6) (list-ref group 6))))
-
-(define (render-cell-group! group frame x-offset y-offset theme-fg theme-bg)
-  (define base (cell-style (list-ref group 2)
-                           (list-ref group 3)
-                           (list-ref group 4)
-                           theme-fg
-                           theme-bg))
-  (define style (if (list-ref group 6)
-                    (style-with-reversed base)
-                    base))
+(define (render-run! frame x-offset y-offset theme-fg theme-bg
+                     x y fg bg attrs text selected)
+  (define base (cell-style fg bg attrs theme-fg theme-bg))
+  (define style (if (= selected 1) (style-with-reversed base) base))
   (frame-set-string! frame
-                     (+ x-offset (list-ref group 0))
-                     (+ y-offset (list-ref group 1))
-                     (list-ref group 5)
+                     (+ x-offset x)
+                     (+ y-offset y)
+                     text
                      style))
 
+(define *render-selection-bias* 1000000)
+
+(define (render-int value)
+  (inexact->exact (truncate value)))
+
 (define (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg selection)
-  (let loop ([cells (vte/render-cells vt)]
-             [group #f])
-    (cond
-      [(null? cells)
-       (when group
-         (render-cell-group! group frame x-offset y-offset theme-fg theme-bg))]
-      [else
-       (let* ([x (car cells)]
-              [tail1 (cdr cells)]
-              [y (car tail1)]
-              [tail2 (cdr tail1)]
-              [fg (car tail2)]
-              [tail3 (cdr tail2)]
-              [bg (car tail3)]
-              [tail4 (cdr tail3)]
-              [attrs (car tail4)]
-              [tail5 (cdr tail4)]
-              [text (car tail5)]
-              [rest (cdr tail5)]
-              [cell (list x y fg bg attrs text
-                          (and (cell-selected? selection x y) #t)
-                          1)])
-         (cond
-           [(and group (render-cell-group? group cell))
-            (loop rest
-                  (list (list-ref group 0)
-                        (list-ref group 1)
-                        (list-ref group 2)
-                        (list-ref group 3)
-                        (list-ref group 4)
-                        (string-append (list-ref group 5) (list-ref cell 5))
-                        (list-ref group 6)
-                        (+ (list-ref group 7) 1)))]
-           [else
-            (when group
-              (render-cell-group! group frame x-offset y-offset theme-fg theme-bg))
-            (loop rest cell)]))])))
+  (define has-selection (and selection #t))
+  (define x1 (+ *render-selection-bias*
+                 (if selection (render-int (list-ref selection 0)) 0)))
+  (define y1 (+ *render-selection-bias*
+                 (if selection (render-int (list-ref selection 1)) 0)))
+  (define x2 (+ *render-selection-bias*
+                 (if selection (render-int (list-ref selection 2)) 0)))
+  (define y2 (+ *render-selection-bias*
+                 (if selection (render-int (list-ref selection 3)) 0)))
+  (let loop ([values (vte/render-runs vt has-selection x1 y1 x2 y2)])
+    (unless (null? values)
+      (let* ([x (car values)]
+             [tail1 (cdr values)]
+             [y (car tail1)]
+             [tail2 (cdr tail1)]
+             [fg (car tail2)]
+             [tail3 (cdr tail2)]
+             [bg (car tail3)]
+             [tail4 (cdr tail3)]
+             [attrs (car tail4)]
+             [tail5 (cdr tail4)]
+             [text (car tail5)]
+             [tail6 (cdr tail5)]
+             [selected (car tail6)])
+        (render-run! frame x-offset y-offset theme-fg theme-bg
+                     x y fg bg attrs text selected)
+        (loop (cdr tail6))))))
 
 (define (cell-selected? selection x y)
   (and selection
