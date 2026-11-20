@@ -41,6 +41,7 @@ struct Pty {
     receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
     writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
     dead: Arc<AtomicBool>,
+    shell_pgid: Option<i32>,
 }
 
 unsafe impl Send for Pty {}
@@ -138,6 +139,21 @@ impl Pty {
             RResult::ROk(FFIValue::BoolV(false))
         }
     }
+
+    #[cfg(unix)]
+    fn foreground_is_shell(&self) -> bool {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return false;
+        };
+
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        pgid > 0 && self.shell_pgid == Some(pgid as i32)
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_is_shell(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for Pty {
@@ -180,6 +196,14 @@ fn create_pty_impl(shell: &str, rows: usize, cols: usize) -> Result<Pty> {
         .spawn_command(command)
         .context("unable to spawn shell")?;
 
+    #[cfg(unix)]
+    let shell_pgid = child.process_id().and_then(|pid| {
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        if pgid > 0 { Some(pgid as i32) } else { None }
+    });
+    #[cfg(not(unix))]
+    let shell_pgid = None;
+
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -218,6 +242,7 @@ fn create_pty_impl(shell: &str, rows: usize, cols: usize) -> Result<Pty> {
         receiver: Arc::new(AsyncMutex::new(receiver)),
         writer: Arc::new(parking_lot::Mutex::new(writer)),
         dead,
+        shell_pgid,
     })
 }
 
@@ -617,6 +642,7 @@ fn create_module() -> FFIModule {
         .register_fn("pty-alive?", Pty::alive)
         .register_fn("pty-read", Pty::async_read)
         .register_fn("pty-foreground-process", Pty::foreground_pgid)
+        .register_fn("pty-foreground-shell?", Pty::foreground_is_shell)
         .register_fn("virtual-terminal", virtual_terminal)
         .register_fn("vte/advance-bytes", VTerm::advance_bytes)
         .register_fn("vte/resize", VTerm::resize)

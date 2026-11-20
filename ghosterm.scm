@@ -14,6 +14,7 @@
                           pty-kill
                           pty-alive?
                           pty-read
+                          pty-foreground-shell?
                           virtual-terminal
                           vte/advance-bytes
                           vte/resize
@@ -898,10 +899,11 @@
     ;; Ctrl-D: close the active tab (and the pane when it was the last).
     [(and (key-event? event)
           (let ([c (key-event-char event)])
-            (and c
-                 (char=? c #\d)
-                 (ghost-bit? (or (key-event-modifier event) 0) 1))))
-     (close-terminal-tab direction)
+             (and c
+                  (char=? c #\d)
+                  (ghost-bit? (or (key-event-modifier event) 0) 1)
+                  (pty-foreground-shell? (Terminal-pty state)))))
+      (close-terminal-tab direction)
      event-result/consume]
 
     [(key-event? event)
