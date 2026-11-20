@@ -35,6 +35,264 @@ fn pack_color(color: libghostty_vt::style::RgbColor) -> isize {
     (((color.r as isize) << 16) | ((color.g as isize) << 8) | (color.b as isize)) as isize
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn abbreviate_cwd(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = if !home.is_empty() && path.starts_with(&home) {
+        let rest = &path[home.len()..];
+        if rest.is_empty() {
+            "~".to_string()
+        } else if rest.starts_with('/') {
+            format!("~{}", rest)
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+
+    let absolute = path.starts_with('/');
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return if absolute { "/".to_string() } else { path };
+    }
+
+    let last = parts.len() - 1;
+    let mut result = String::new();
+    if absolute && !path.starts_with('~') {
+        result.push('/');
+    }
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            result.push('/');
+        }
+        if index == last {
+            result.push_str(part);
+        } else if let Some(ch) = part.chars().next() {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn process_for_pgid(pgid: i32) -> Option<i32> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let Some(_state) = fields.next() else {
+            continue;
+        };
+        let Some(_ppid) = fields.next() else {
+            continue;
+        };
+        let Some(pgrp) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pgrp == pgid {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_comm(pid: i32) -> String {
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if comm.is_some() {
+        return comm.unwrap();
+    }
+
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return String::new();
+    };
+    match (stat.find('('), stat.rfind(')')) {
+        (Some(start), Some(end)) if start < end => stat[start + 1..end].to_string(),
+        _ => String::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: i32) -> String {
+    if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+        let value = path.to_string_lossy().into_owned();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+
+    let Ok(environ) = std::fs::read(format!("/proc/{}/environ", pid)) else {
+        return String::new();
+    };
+    for entry in environ.split(|byte| *byte == 0) {
+        if entry.starts_with(b"PWD=") {
+            return String::from_utf8_lossy(&entry[4..]).into_owned();
+        }
+    }
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn child_pids(pid: i32) -> Vec<i32> {
+    let mut result = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", pid)) else {
+        return result;
+    };
+    for task in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        for value in children.split_whitespace() {
+            if let Ok(child) = value.parse::<i32>() {
+                result.push(child);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_pids(root: i32) -> Vec<i32> {
+    let mut result = Vec::new();
+    let mut queue = vec![root];
+    let mut seen = Vec::new();
+
+    while let Some(pid) = queue.pop() {
+        if seen.contains(&pid) {
+            continue;
+        }
+        seen.push(pid);
+        for child in child_pids(pid) {
+            result.push(child);
+            queue.push(child);
+        }
+    }
+
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if result == size { Some(info) } else { None }
+}
+
+#[cfg(target_os = "macos")]
+fn process_comm(pid: i32) -> String {
+    let Some(info) = bsd_info(pid) else {
+        return String::new();
+    };
+    for name in [info.pbi_name.as_slice(), info.pbi_comm.as_slice()] {
+        let value = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> String {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if result != size {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn process_for_pgid(pgid: i32) -> Option<i32> {
+    let mut pids = vec![0i32; 4096];
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    for pid in pids.into_iter().take(count.max(0) as usize) {
+        if pid > 0 && bsd_info(pid).map(|info| info.pbi_pgid as i32) == Some(pgid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn child_pids(pid: i32) -> Vec<i32> {
+    let mut children = vec![0i32; 1024];
+    let count = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            children.as_mut_ptr() as *mut libc::c_void,
+            (children.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    children
+        .into_iter()
+        .take(count.max(0) as usize)
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_pids(root: i32) -> Vec<i32> {
+    let mut result = Vec::new();
+    let mut queue = vec![root];
+    let mut seen = Vec::new();
+
+    while let Some(pid) = queue.pop() {
+        if seen.contains(&pid) {
+            continue;
+        }
+        seen.push(pid);
+        for child in child_pids(pid) {
+            result.push(child);
+            queue.push(child);
+        }
+    }
+
+    result
+}
+
 struct Pty {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -150,9 +408,89 @@ impl Pty {
         pgid > 0 && self.shell_pgid == Some(pgid as i32)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn foreground_title(&self) -> String {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return String::new();
+        };
+
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        let shell_pid = self.child.process_id().map(|pid| pid as i32);
+        let mut pids: Vec<i32> = Vec::new();
+        if let Some(pid) = shell_pid {
+            for child in child_pids(pid) {
+                if !pids.contains(&child) {
+                    pids.push(child);
+                }
+            }
+        }
+        if pgid > 0 {
+            if let Some(pid) = process_for_pgid(pgid) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+            if !pids.contains(&pgid) {
+                pids.push(pgid);
+            }
+        }
+        if let Some(pid) = shell_pid {
+            for child in descendant_pids(pid) {
+                if !pids.contains(&child) {
+                    pids.push(child);
+                }
+            }
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+
+        let mut name = String::new();
+        let mut cwd = String::new();
+        let mut title_pid = None;
+        let mut fallback_name = String::new();
+        let mut fallback_pid = None;
+        for pid in pids {
+            let candidate_name = process_comm(pid);
+            let candidate_cwd = process_cwd(pid);
+            if fallback_name.is_empty() && !candidate_name.is_empty() {
+                fallback_name = candidate_name.clone();
+                fallback_pid = Some(pid);
+            }
+            if !candidate_cwd.is_empty() {
+                name = candidate_name;
+                cwd = candidate_cwd;
+                title_pid = Some(pid);
+                break;
+            }
+        }
+        if name.is_empty() {
+            name = fallback_name;
+            title_pid = fallback_pid;
+        }
+
+        if title_pid.map(|pid| Some(pid) == shell_pid || self.shell_pgid == Some(pid)) == Some(true)
+        {
+            name.clear();
+        }
+
+        let cwd = abbreviate_cwd(&cwd);
+        match (name.is_empty(), cwd.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => cwd,
+            (false, true) => name,
+            (false, false) => format!("{} {}", name, cwd),
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn foreground_title(&self) -> String {
+        String::new()
+    }
+
     #[cfg(not(unix))]
-    fn foreground_is_shell(&self) -> bool {
-        false
+    fn foreground_title(&self) -> String {
+        String::new()
     }
 }
 
@@ -643,6 +981,7 @@ fn create_module() -> FFIModule {
         .register_fn("pty-read", Pty::async_read)
         .register_fn("pty-foreground-process", Pty::foreground_pgid)
         .register_fn("pty-foreground-shell?", Pty::foreground_is_shell)
+        .register_fn("pty-foreground-title", Pty::foreground_title)
         .register_fn("virtual-terminal", virtual_terminal)
         .register_fn("vte/advance-bytes", VTerm::advance_bytes)
         .register_fn("vte/resize", VTerm::resize)

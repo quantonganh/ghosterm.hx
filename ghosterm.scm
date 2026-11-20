@@ -15,6 +15,7 @@
                           pty-alive?
                           pty-read
                           pty-foreground-shell?
+                          pty-foreground-title
                           virtual-terminal
                           vte/advance-bytes
                           vte/resize
@@ -518,7 +519,14 @@
                                border-style
                                "top"
                                "plain"))
-     (render-tab-bar frame pane group focused border-base border-style)
+      (render-tab-bar frame
+                      pane
+                      group
+                      focused
+                      border-base
+                      border-style
+                      (style-fg (theme->bg *helix.cx*) Color/Gray))
+
 
       (define x-offset (area-x pane))
       (define y-offset (+ (area-y pane) 1))
@@ -536,25 +544,32 @@
         (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
 
 
-(define (tab-label index)
-  (string-append " " (number->string (+ index 1)) " "))
+(define (tab-title-label index state pane count)
+  (define title (pty-foreground-title (Terminal-pty state)))
+  (define width (max 3 (quotient (area-width pane) (max 1 count))))
+  (fit-border-title
+   (string-append " " (number->string (+ index 1)) ": " title " ")
+   width))
 
-(define (render-tab-bar frame pane group focused border-base border-style)
+(define (render-tab-bar frame pane group focused border-base border-style dim-style)
   (define x (+ (area-x pane) 1))
   (define max-x (+ (area-x pane) (area-width pane)))
   (let loop ([tabs (terminal-tabs-list group)]
              [i 0])
     (when (pair? tabs)
-      (let* ([label (tab-label i)]
+      (let* ([label (tab-title-label i (car tabs) pane (length tabs))]
              [style
               (cond
                 [(= i (terminal-tabs-active-index group))
                  (if focused (style-with-bold border-base) border-style)]
-                [else
-                 (if focused (style-with-dim border-base) border-style)])])
+                [else dim-style])])
         (when (< (+ x (string-length label)) max-x)
-          (frame-set-string! frame x (area-y pane) label style)
-          (set! x (+ x (string-length label) 1))))
+          (frame-set-string! frame x (area-y pane) label style))
+        (set! x (+ x (string-length label)))
+        (when (pair? (cdr tabs))
+          (when (< (+ x 4) max-x)
+            (frame-set-string! frame x (area-y pane) " | " dim-style))
+          (set! x (+ x 4))))
       (loop (cdr tabs) (+ i 1)))))
 
 (define (tab-index-at-column group pane col)
@@ -565,15 +580,19 @@
     (cond
       [(null? tabs) #f]
       [else
-       (let* ([label (tab-label i)]
+       (let* ([label (tab-title-label i (car tabs) pane (length tabs))]
               [width (string-length label)])
          (if (and (>= col x)
                   (< col (+ x width))
                   (< (+ x width) max-x))
-             i
-             (begin
-               (set! x (+ x width 1))
-               (loop (cdr tabs) (+ i 1)))))])))
+              i
+              (begin
+                (set! x (+ x width))
+                (when (pair? (cdr tabs))
+                  (set! x (+ x 4)))
+                (loop (cdr tabs) (+ i 1)))))])))
+
+
 
 (define (render-right-terminal _group state rect frame)
   (define pane (terminal-pane-area-right rect))
@@ -645,10 +664,12 @@
              [stagger (min index 5)]
              [x (+ (area-x rect)
                    (quotient (- total-width width) 2)
-                   (* 4 stagger))]
+                    (* 3 stagger))]
+
              [y (+ (area-y rect)
                    (quotient (- total-height height) 2)
-                   (* 2 stagger))])
+                                       stagger)]
+)
         (area (min x (+ (area-x rect) (- total-width width)))
               (min y (+ (area-y rect) (- total-height height)))
               width
@@ -677,6 +698,25 @@
               (cons (if percent? 'percent 'cells)
                     (inexact->exact (truncate value)))))))
 
+(define (fit-border-title text width)
+  (cond
+    [(<= width 0) ""]
+    [(<= (string-length text) width) text]
+    [(<= width 3) (substring text 0 width)]
+    [else (string-append (substring text 0 (- width 3)) "...")]))
+
+(define (render-float-title! frame pane pty style index)
+  (define title (pty-foreground-title pty))
+  (define width (max 0 (- (area-width pane) 2)))
+  (when (> width 0)
+    (frame-set-string! frame
+                       (+ (area-x pane) 1)
+                       (area-y pane)
+                       (fit-border-title
+                        (string-append " " (number->string (+ index 1)) ": " title " ")
+                        width)
+                       style)))
+
 (define (render-float-terminal group state rect frame)
   (define tabs (terminal-tabs-list group))
   (define active (terminal-tabs-active-index group))
@@ -684,11 +724,11 @@
   ;; Render the background floats first so the active one stays on top.
   (while (< i (length tabs))
     (unless (= i active)
-      (render-float-term (list-ref tabs i) rect frame i))
+      (render-float-term (list-ref tabs i) rect frame i #f))
     (set! i (+ i 1)))
-  (render-float-term state rect frame active))
+  (render-float-term state rect frame active #t))
 
-(define (render-float-term term rect frame index)
+(define (render-float-term term rect frame index active?)
   (define pane (float-pane-area rect index))
 
   (cond
@@ -717,33 +757,44 @@
        (or (style->fg (theme->fg *helix.cx*)) Color/White))
      (define theme-bg
        (or (style->bg (theme->bg *helix.cx*)) Color/Black))
-     (define border-base (style-fg (theme->bg *helix.cx*) theme-fg))
-     (define border-style
-       (if focused border-base (style-with-dim border-base)))
+      (define border-base (style-fg (theme->bg *helix.cx*) theme-fg))
+      (define border-style
+        (if (and focused active?)
+            border-base
+            (style-fg (theme->bg *helix.cx*) Color/Gray)))
 
-     (buffer/clear frame pane)
-      (block/render frame
-              pane
-              (make-block (theme->bg *helix.cx*)
-                          border-style
-                          "all"
-                          "rounded"))
+      (buffer/clear frame pane)
 
-
-      (define x-offset (+ (area-x pane) 1))
-      (define y-offset (+ (area-y pane) 1))
-
-       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
-                               (unbox (Terminal-selection term)))
+       (block/render frame
+               pane
+                (make-block (theme->bg *helix.cx*)
+                            border-style
+                            "all"
+                            "rounded"))
 
 
-       (define cursor (Terminal-cursor term))
-      (define cursor-pos (terminal-display-cursor term vt text-rows text-cols))
-      (define cursor-shown? (and focused cursor-pos))
-      (set-box! (Terminal-cursor-shown? term) cursor-shown?)
-      (when cursor-shown?
-        (set-position-row! cursor (+ y-offset (car (cdr cursor-pos))))
-        (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
+       (define x-offset (+ (area-x pane) 1))
+       (define y-offset (+ (area-y pane) 1))
+
+       (when active?
+         (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                                 (unbox (Terminal-selection term)))
+
+         (define cursor (Terminal-cursor term))
+         (define cursor-pos (terminal-display-cursor term vt text-rows text-cols))
+         (define cursor-shown? (and focused cursor-pos))
+         (set-box! (Terminal-cursor-shown? term) cursor-shown?)
+         (when cursor-shown?
+           (set-position-row! cursor (+ y-offset (car (cdr cursor-pos))))
+           (set-position-col! cursor (+ x-offset (car cursor-pos)))))
+
+       (unless active?
+         (set-box! (Terminal-cursor-shown? term) #f))
+
+       (render-float-title! frame pane pty border-style index)]))
+
+
+
 
 
 (define (render-run! frame x-offset y-offset theme-fg theme-bg
@@ -894,6 +945,10 @@
      (toggle-terminal 'float)
      event-result/consume]
 
+    [(terminal-new-float-trigger? event)
+     (new-floating-terminal-tab!)
+     event-result/consume]
+
     [(not (and state (unbox (Terminal-active state))))
      event-result/ignore]
 
@@ -965,6 +1020,14 @@
 (define (terminal-new-tab-trigger? event)
   (terminal-alt-key? event #\t))
 
+(define (terminal-new-float-trigger? event)
+  (and (key-event? event)
+       (let ([mods (or (key-event-modifier event) 0)]
+             [c (key-event-char event)])
+         (and c
+              (= (char->integer c) 20)
+              (or (ghost-bit? mods 1) (= mods 0))))))
+
 (define (terminal-next-tab-trigger? event)
   (terminal-alt-key? event #\n))
 
@@ -1031,6 +1094,10 @@
 
     [(terminal-toggle-float-trigger? event)
      (toggle-terminal 'float)
+     event-result/consume]
+
+    [(terminal-new-float-trigger? event)
+     (new-floating-terminal-tab!)
      event-result/consume]
 
     [else event-result/ignore]))
@@ -1439,6 +1506,14 @@
         (if (ghost-bit? mods 2) 2 0)
         (if (ghost-bit? mods 1) 4 0)
         (if (ghost-bit? mods 3) 8 0)))
+
+(define (new-floating-terminal-tab!)
+  (if (terminal-visible? 'float)
+      (begin
+        (new-terminal-tab 'float)
+        (focus-terminal! 'float)
+        (raise-float!))
+      (show-terminal 'float)))
 
 (define (toggle-terminal direction)
   (define term (terminal-active-term direction))
