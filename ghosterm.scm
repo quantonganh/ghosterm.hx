@@ -218,6 +218,19 @@
     [(= index 0) (cdr items)]
     [else (cons (car items) (remove-list-at (cdr items) (- index 1)))]))
 
+(define (terminal-reveal-prompt! term)
+  (when term
+    (vte/scroll-bottom (Terminal-vte term))
+    (helix.redraw)))
+
+(define (set-terminal-focused! term focused?)
+  (when term
+    (unless (eq? (unbox (Terminal-focused? term)) focused?)
+      (set-box! (Terminal-focused? term) focused?)
+      (when focused?
+        (reset-copy-mode! term)
+        (vte/scroll-bottom (Terminal-vte term))))))
+
 (define (new-terminal-tab direction)
   (if (not (terminal-get direction))
       (show-terminal direction)
@@ -226,11 +239,11 @@
              [was-focused? (and old (unbox (Terminal-focused? old)))]
              [term (spawn-terminal-tab direction)])
         (when old
-          (set-box! (Terminal-focused? old) #f))
+          (set-terminal-focused! old #f))
         (append-terminal-tab! group term)
         (set-box! (Terminal-active term) #t)
         (when was-focused?
-          (set-box! (Terminal-focused? term) #t))
+          (set-terminal-focused! term #t))
         (helix.redraw))))
 
 (define (switch-terminal-tab! direction index)
@@ -242,12 +255,12 @@
         (let* ([old (terminal-tabs-active-term group)]
                [was-focused? (and old (unbox (Terminal-focused? old)))])
           (when old
-            (set-box! (Terminal-focused? old) #f))
+            (set-terminal-focused! old #f))
           (set-box! (TerminalTabs-active group) index)
           (let ([term (terminal-tabs-active-term group)])
             (set-box! (Terminal-active term) #t)
             (when was-focused?
-              (set-box! (Terminal-focused? term) #t))
+              (set-terminal-focused! term #t))
             (helix.redraw)))))))
 
 (define (switch-terminal-tab-relative direction delta)
@@ -379,9 +392,9 @@
       (lambda (other)
         (define other-term (terminal-active-term other))
         (when (and other-term (not (eq? other direction)))
-          (set-box! (Terminal-focused? other-term) #f)))
+          (set-terminal-focused! other-term #f)))
       (list 'bottom 'right 'float))
-    (set-box! (Terminal-focused? term) #t)
+    (set-terminal-focused! term #t)
     (set! *focused-direction* direction)
     (set! *last-direction* direction)
     (auto-save-editor!)
@@ -393,7 +406,7 @@
   (when direction
     (define term (terminal-active-term direction))
     (when term
-      (set-box! (Terminal-focused? term) #f))
+      (set-terminal-focused! term #f))
     (set! *focused-direction* #f)
     (restore-editor-cursor!)
     (auto-reload-editor!)
@@ -1024,6 +1037,7 @@
      event-result/consume]
 
      [(paste-event? event)
+      (terminal-reveal-prompt! state)
       (let ([status (vte/paste (Terminal-vte state) (paste-event-string event))])
         (cond
           [(string=? status "rejected")
@@ -1443,6 +1457,9 @@
   (define mods (or (key-event-modifier event) 0))
   (define c (key-event-char event))
 
+  (unless (copy-mode-active? state)
+    (terminal-reveal-prompt! state))
+
   (cond
     [(copy-mode-active? state)
      (handle-copy-mode-key state event)]
@@ -1561,7 +1578,7 @@
   (define term (terminal-active-term direction))
   (when term
     (define was-focused? (unbox (Terminal-focused? term)))
-    (set-box! (Terminal-focused? term) #f)
+    (set-terminal-focused! term #f)
     (set-box! (Terminal-active term) #f)
     (reset-copy-mode! term)
     (when was-focused?
@@ -1581,7 +1598,7 @@
         (let* ([term (list-ref tabs index)]
                [was-focused? (unbox (Terminal-focused? term))])
           (set-box! (Terminal-active term) #f)
-          (set-box! (Terminal-focused? term) #f)
+          (set-terminal-focused! term #f)
           (set-box! (Terminal-cursor-shown? term) #f)
           (set-box! (Terminal-kill-switch term) #t)
           (pty-kill (Terminal-pty term))
@@ -1604,7 +1621,7 @@
                             (min index (- (length remaining) 1)))
                   (let ([new-term (terminal-tabs-active-term group)])
                     (set-box! (Terminal-active new-term) #t)
-                    (set-box! (Terminal-focused? new-term) was-focused?)))))
+                    (set-terminal-focused! new-term was-focused?)))))
           (helix.redraw))))))
 
 (define (auto-save-editor!)
