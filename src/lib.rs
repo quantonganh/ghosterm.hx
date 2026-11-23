@@ -1,5 +1,12 @@
+use std::cell::{Cell, RefCell};
+#[cfg(unix)]
+use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+use std::time::{Duration, Instant};
 
 use abi_stable::std_types::{RBoxError, RResult, RVec};
 use anyhow::{Context, Result};
@@ -26,6 +33,7 @@ const ATTR_STRIKETHROUGH: u16 = 1 << 6;
 const ATTR_OVERLINE: u16 = 1 << 7;
 const ATTR_UNDERLINE: u16 = 1 << 8;
 const SELECTION_BIAS: isize = 1_000_000;
+const RENDER_HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn to_rbox(err: impl std::fmt::Display) -> RBoxError {
     RBoxError::new(std::io::Error::other(err.to_string()))
@@ -621,9 +629,119 @@ struct CellData {
     attrs: u16,
 }
 
+#[derive(Clone)]
+struct Frame {
+    cells: Vec<CellData>,
+    cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+    default_fg: isize,
+    default_bg: isize,
+    cols: u16,
+    rows: u16,
+}
+
+fn capture_frame<'alloc, 'cb>(
+    state: &mut RenderState<'alloc>,
+    term: &Terminal<'alloc, 'cb>,
+) -> Option<Frame> {
+    let mut frame = Frame {
+        cells: Vec::new(),
+        cursor: None,
+        cursor_visible: false,
+        default_fg: -1,
+        default_bg: -1,
+        cols: 0,
+        rows: 0,
+    };
+
+    let snapshot = state.update(term).ok()?;
+
+    if let Ok(colors) = snapshot.colors() {
+        frame.default_fg = pack_color(colors.foreground);
+        frame.default_bg = pack_color(colors.background);
+    }
+
+    if let Ok(cur) = snapshot.cursor() {
+        frame.cursor_visible = cur.visible;
+        if let Some(viewport) = cur.viewport {
+            frame.cursor = Some((viewport.x, viewport.y));
+        }
+    }
+
+    frame.cols = snapshot.cols().ok().filter(|cols| *cols > 0).unwrap_or(0);
+    frame.rows = snapshot.rows().unwrap_or(0);
+    let cols = frame.cols;
+
+    let mut row_iterator = RowIterator::new().ok()?;
+    let mut cell_iterator = CellIterator::new().ok()?;
+    let mut rows_iteration = row_iterator.update(&snapshot).ok()?;
+
+    while let Some(row) = rows_iteration.next() {
+        let mut in_row = 0u16;
+        if let Ok(mut cells) = cell_iterator.update(row) {
+            while let Some(cell) = cells.next() {
+                let mut text = String::new();
+                let _ = cell.graphemes_utf8(&mut text);
+
+                let fg = cell.fg_color().ok().flatten().map(pack_color).unwrap_or(-1);
+                let bg = cell.bg_color().ok().flatten().map(pack_color).unwrap_or(-1);
+
+                let mut attrs = 0u16;
+                if let Ok(style) = cell.style() {
+                    if style.bold {
+                        attrs |= ATTR_BOLD;
+                    }
+                    if style.italic {
+                        attrs |= ATTR_ITALIC;
+                    }
+                    if style.faint {
+                        attrs |= ATTR_FAINT;
+                    }
+                    if style.blink {
+                        attrs |= ATTR_BLINK;
+                    }
+                    if style.inverse {
+                        attrs |= ATTR_INVERSE;
+                    }
+                    if style.invisible {
+                        attrs |= ATTR_INVISIBLE;
+                    }
+                    if style.strikethrough {
+                        attrs |= ATTR_STRIKETHROUGH;
+                    }
+                    if style.overline {
+                        attrs |= ATTR_OVERLINE;
+                    }
+                    if !matches!(style.underline, Underline::None) {
+                        attrs |= ATTR_UNDERLINE;
+                    }
+                }
+
+                frame.cells.push(CellData {
+                    text,
+                    fg,
+                    bg,
+                    attrs,
+                });
+                in_row += 1;
+            }
+        }
+
+        while in_row < cols {
+            frame.cells.push(CellData::default());
+            in_row += 1;
+        }
+    }
+
+    Some(frame)
+}
+
 struct VTerm {
     term: Terminal<'static, 'static>,
-    state: RenderState<'static>,
+    state: Rc<RefCell<RenderState<'static>>>,
+    frame: Rc<RefCell<Frame>>,
+    held: Rc<Cell<bool>>,
+    hold_started: Rc<Cell<Instant>>,
     cells: Vec<CellData>,
     rows: u16,
     cols: u16,
@@ -659,11 +777,46 @@ impl VTerm {
         })
         .context("unable to register pty write callback")?;
 
-        let state = RenderState::new().context("unable to create render state")?;
+        let state = Rc::new(RefCell::new(
+            RenderState::new().context("unable to create render state")?,
+        ));
+        let frame = Rc::new(RefCell::new(Frame {
+            cells: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+            default_fg: -1,
+            default_bg: -1,
+            cols,
+            rows,
+        }));
+        let held = Rc::new(Cell::new(false));
+        let hold_started = Rc::new(Cell::new(Instant::now()));
+
+        let hold_state = Rc::clone(&state);
+        let hold_frame = Rc::clone(&frame);
+        let hold_flag = Rc::clone(&held);
+        let hold_started_at = Rc::clone(&hold_started);
+        term.on_render_hold(move |term, holding| {
+            if holding {
+                if let (Ok(mut state), Ok(mut frame)) =
+                    (hold_state.try_borrow_mut(), hold_frame.try_borrow_mut())
+                {
+                    if let Some(captured) = capture_frame(&mut state, term) {
+                        *frame = captured;
+                    }
+                }
+                hold_started_at.set(Instant::now());
+            }
+            hold_flag.set(holding);
+        })
+        .context("unable to register render hold callback")?;
 
         Ok(Self {
             term,
             state,
+            frame,
+            held,
+            hold_started,
             cells: Vec::new(),
             rows,
             cols,
@@ -675,118 +828,44 @@ impl VTerm {
         })
     }
 
+    fn apply_frame(&mut self, frame: Frame) {
+        self.cells = frame.cells;
+        self.cursor = frame.cursor;
+        self.cursor_visible = frame.cursor_visible;
+        self.default_fg = frame.default_fg;
+        self.default_bg = frame.default_bg;
+        if frame.cols > 0 {
+            self.cols = frame.cols;
+        }
+        if frame.rows > 0 {
+            self.rows = frame.rows;
+        }
+        self.iter = None;
+    }
+
     fn refresh(&mut self) {
-        let mut new_cells: Vec<CellData> = Vec::new();
-        let mut cursor = None;
-        let mut cursor_visible = false;
-        let mut default_fg = self.default_fg;
-        let mut default_bg = self.default_bg;
-        let mut cols = self.cols;
-
-        {
-            let snapshot = match self.state.update(&self.term) {
-                Ok(snapshot) => snapshot,
-                Err(_) => return,
-            };
-
-            if let Ok(colors) = snapshot.colors() {
-                default_fg = pack_color(colors.foreground);
-                default_bg = pack_color(colors.background);
-            }
-
-            if let Ok(cur) = snapshot.cursor() {
-                cursor_visible = cur.visible;
-                if let Some(viewport) = cur.viewport {
-                    cursor = Some((viewport.x, viewport.y));
-                }
-            }
-
-            if let Ok(snapshot_cols) = snapshot.cols() {
-                if snapshot_cols > 0 {
-                    cols = snapshot_cols;
-                }
-            }
-            let rows = snapshot.rows().unwrap_or(self.rows);
-
-            let Ok(mut row_iterator) = RowIterator::new() else {
-                return;
-            };
-            let Ok(mut cell_iterator) = CellIterator::new() else {
-                return;
-            };
-            let Ok(mut rows_iteration) = row_iterator.update(&snapshot) else {
-                return;
-            };
-
-            while let Some(row) = rows_iteration.next() {
-                let mut in_row = 0u16;
-                {
-                    if let Ok(mut cells) = cell_iterator.update(row) {
-                        while let Some(cell) = cells.next() {
-                            let mut text = String::new();
-                            let _ = cell.graphemes_utf8(&mut text);
-
-                            let fg = cell.fg_color().ok().flatten().map(pack_color).unwrap_or(-1);
-                            let bg = cell.bg_color().ok().flatten().map(pack_color).unwrap_or(-1);
-
-                            let mut attrs = 0u16;
-                            if let Ok(style) = cell.style() {
-                                if style.bold {
-                                    attrs |= ATTR_BOLD;
-                                }
-                                if style.italic {
-                                    attrs |= ATTR_ITALIC;
-                                }
-                                if style.faint {
-                                    attrs |= ATTR_FAINT;
-                                }
-                                if style.blink {
-                                    attrs |= ATTR_BLINK;
-                                }
-                                if style.inverse {
-                                    attrs |= ATTR_INVERSE;
-                                }
-                                if style.invisible {
-                                    attrs |= ATTR_INVISIBLE;
-                                }
-                                if style.strikethrough {
-                                    attrs |= ATTR_STRIKETHROUGH;
-                                }
-                                if style.overline {
-                                    attrs |= ATTR_OVERLINE;
-                                }
-                                if !matches!(style.underline, Underline::None) {
-                                    attrs |= ATTR_UNDERLINE;
-                                }
-                            }
-
-                            new_cells.push(CellData {
-                                text,
-                                fg,
-                                bg,
-                                attrs,
-                            });
-                            in_row += 1;
-                        }
-                    }
-                }
-
-                while in_row < cols {
-                    new_cells.push(CellData::default());
-                    in_row += 1;
-                }
-            }
-
-            let _ = rows;
+        if self.held.get() && self.hold_started.get().elapsed() >= RENDER_HOLD_TIMEOUT {
+            let _ = self.term.set_mode(Mode::SYNC_OUTPUT, false);
+            self.held.set(false);
         }
 
-        self.default_fg = default_fg;
-        self.default_bg = default_bg;
-        self.cols = cols;
-        self.cursor = cursor;
-        self.cursor_visible = cursor_visible;
-        self.cells = new_cells;
-        self.iter = None;
+        if self.held.get() {
+            let frame = self.frame.borrow().clone();
+            self.apply_frame(frame);
+            return;
+        }
+
+        let Some(frame) = ({
+            let mut state = self.state.borrow_mut();
+            capture_frame(&mut state, &self.term)
+        }) else {
+            return;
+        };
+
+        if let Ok(mut shared) = self.frame.try_borrow_mut() {
+            *shared = frame.clone();
+        }
+        self.apply_frame(frame);
     }
 
     fn advance_bytes(&mut self, data: RVec<u8>) -> bool {
