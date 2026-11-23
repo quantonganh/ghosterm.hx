@@ -37,6 +37,7 @@
                           vte/paste
                           vte/mouse-event
                           vte/scroll-offset
+                          vte/screen-row-text
                           vte/scroll-up
                           vte/scroll-down
                           vte/scroll-top
@@ -1199,31 +1200,34 @@
 
 (define (sync-copy-selection! state)
   (define mode (unbox (Terminal-copy-selection-mode state)))
+  (define rows (car (copy-mode-size state)))
+  (define max-row (- rows 1))
   (cond
     [(eq? mode 'cell)
      (let* ([anchor (Terminal-copy-anchor state)]
             [cursor (Terminal-copy-cursor state)]
             [ax (position-col anchor)]
-            [ay (position-row anchor)]
+            [ay (copy-mode-limit (position-row anchor) max-row)]
             [cx (position-col cursor)]
-            [cy (position-row cursor)])
-       (set-box! (Terminal-selection state)
-                 (cond
-                   [(< cy ay) (list cx cy ax ay)]
-                   [(and (= cy ay) (< cx ax)) (list cx cy ax ay)]
-                   [else (list ax ay cx cy)])))]
+            [cy (copy-mode-limit (position-row cursor) max-row)])
+        (set-box! (Terminal-selection state)
+                  (cond
+                    [(< cy ay) (list cx cy ax ay)]
+                    [(and (= cy ay) (< cx ax)) (list cx cy ax ay)]
+                    [else (list ax ay cx cy)])))]
     [(eq? mode 'line)
      (let* ([anchor (Terminal-copy-anchor state)]
             [cursor (Terminal-copy-cursor state)]
             [cols (car (cdr (copy-mode-size state)))]
-            [ay (position-row anchor)]
-            [cy (position-row cursor)])
-       (set-box! (Terminal-selection state)
-                 (list 0 (min ay cy) cols (max ay cy))))]
+            [ay (copy-mode-limit (position-row anchor) max-row)]
+            [cy (copy-mode-limit (position-row cursor) max-row)])
+        (set-box! (Terminal-selection state)
+                  (list 0 (min ay cy) cols (max ay cy))))]
     [else
      (set-box! (Terminal-selection state) #f)]))
 
 (define (set-copy-mode-position! state x y)
+
   (define size (copy-mode-size state))
   (define rows (car size))
   (define cols (car (cdr size)))
@@ -1269,8 +1273,11 @@
   (define cx (position-col cursor))
   (define cy (position-row cursor))
   (set-position-col! cursor (position-col anchor))
-  (set-position-row! cursor (position-row anchor))
+  (set-position-row! cursor
+                     (copy-mode-limit (position-row anchor)
+                                      (- (car (copy-mode-size state)) 1)))
   (set-position-col! anchor cx)
+
   (set-position-row! anchor cy)
   (sync-copy-selection! state))
 
@@ -1281,7 +1288,7 @@
     (define cursor (Terminal-copy-cursor state))
     (define anchor (Terminal-copy-anchor state))
     (set-position-row! cursor (copy-mode-limit (+ (position-row cursor) delta) (- rows 1)))
-    (set-position-row! anchor (copy-mode-limit (+ (position-row anchor) delta) (- rows 1)))
+    (set-position-row! anchor (+ (position-row anchor) delta))
     (sync-copy-selection! state)))
 
 (define (copy-mode-scroll! state amount)
@@ -1292,6 +1299,18 @@
         (vte/scroll-down vt amount)
         (vte/scroll-up vt (- amount)))
     (shift-copy-positions-y! state (- before (vte/scroll-offset vt)))))
+
+(define (copy-mode-move-vertical! state x y)
+  (define rows (car (copy-mode-size state)))
+  (cond
+    [(< y 0)
+     (copy-mode-scroll! state -1)
+     (set-copy-mode-position! state x 0)]
+    [(>= y rows)
+     (copy-mode-scroll! state 1)
+     (set-copy-mode-position! state x (- rows 1))]
+    [else
+     (set-copy-mode-position! state x y)]))
 
 (define (copy-mode-prompt-scroll! state up?)
   (define vt (Terminal-vte state))
@@ -1424,8 +1443,8 @@
     [(plain #\o) (swap-copy-ends! state)]
     [(or (plain #\h) (key-event-left? event)) (set-copy-mode-position! state (- x 1) y)]
     [(or (plain #\l) (key-event-right? event)) (set-copy-mode-position! state (+ x 1) y)]
-    [(or (plain #\k) (key-event-up? event)) (set-copy-mode-position! state x (- y 1))]
-    [(or (plain #\j) (key-event-down? event)) (set-copy-mode-position! state x (+ y 1))]
+    [(or (plain #\k) (key-event-up? event)) (copy-mode-move-vertical! state x (- y 1))]
+    [(or (plain #\j) (key-event-down? event)) (copy-mode-move-vertical! state x (+ y 1))]
     [(plain #\w) (copy-mode-forward-word! state)]
     [(plain #\b) (copy-mode-backward-word! state)]
     [(plain #\e) (copy-mode-word-end! state)]
@@ -1806,30 +1825,85 @@
           (when before
             (shift-selection-y! state (- before (vte/scroll-offset vt))))))))
 
+(define (copy-mode-range state)
+  (define vt (Terminal-vte state))
+  (define size (copy-mode-size state))
+  (define cols (car (cdr size)))
+  (define offset (vte/scroll-offset vt))
+  (define anchor (Terminal-copy-anchor state))
+  (define cursor (Terminal-copy-cursor state))
+  (define ax (position-col anchor))
+  (define ay (+ offset (position-row anchor)))
+  (define cx (position-col cursor))
+  (define cy (+ offset (position-row cursor)))
+  (if (eq? (unbox (Terminal-copy-selection-mode state)) 'line)
+      (list 0 (min ay cy) cols (max ay cy))
+      (if (or (< cy ay) (and (= cy ay) (< cx ax)))
+          (list cx cy ax ay)
+          (list ax ay cx cy))))
+
+(define (trim-trailing-whitespace text)
+  (let loop ([end (string-length text)])
+    (cond
+      [(<= end 0) ""]
+      [(char-whitespace? (string-ref text (- end 1))) (loop (- end 1))]
+      [else (substring text 0 end)])))
+
+(define (screen-row-copy-text vt row start end)
+  (trim-trailing-whitespace (vte/screen-row-text vt row start end)))
+
+(define (visible-row-copy-text vt row start end cols)
+  (trim-trailing-whitespace (substring (terminal-row-text vt row cols) start end)))
+
+(define (screen-rows-text vt from to cols)
+  (let loop ([y from] [acc '()])
+    (if (>= y to)
+        (reverse acc)
+        (loop (+ y 1) (cons (screen-row-copy-text vt y 0 cols) acc)))))
+
+(define (copy-mode-selection->text state)
+  (define vt (Terminal-vte state))
+  (define cols (car (cdr (copy-mode-size state))))
+  (define range (copy-mode-range state))
+  (define x1 (list-ref range 0))
+  (define y1 (list-ref range 1))
+  (define x2 (list-ref range 2))
+  (define y2 (list-ref range 3))
+  (if (= y1 y2)
+      (screen-row-copy-text vt y1 x1 x2)
+      (string-join
+       (append
+        (list (screen-row-copy-text vt y1 x1 cols))
+        (screen-rows-text vt (+ y1 1) y2 cols)
+        (list (screen-row-copy-text vt y2 0 x2)))
+       "\n")))
+
 (define (selection->text state selection)
-  (define size (unbox (Terminal-size state)))
-  (if (not size)
-      ""
-      (let* ([cols (car (cdr size))]
-             [vt (Terminal-vte state)]
-             [x1 (min cols (list-ref selection 0))]
-             [y1 (list-ref selection 1)]
-             [x2 (min cols (list-ref selection 2))]
-             [y2 (list-ref selection 3)])
-        (if (= y1 y2)
-            (substring (terminal-row-text vt y1 cols) x1 x2)
-            (string-join
-             (append
-              (list (substring (terminal-row-text vt y1 cols) x1 cols))
-              (terminal-rows-text vt (+ y1 1) y2 cols)
-              (list (substring (terminal-row-text vt y2 cols) 0 x2)))
-             "\n")))))
+  (if (copy-mode-active? state)
+      (copy-mode-selection->text state)
+      (let ([size (unbox (Terminal-size state))])
+        (if (not size)
+            ""
+            (let* ([cols (car (cdr size))]
+                   [vt (Terminal-vte state)]
+                   [x1 (min cols (list-ref selection 0))]
+                   [y1 (list-ref selection 1)]
+                   [x2 (min cols (list-ref selection 2))]
+                   [y2 (list-ref selection 3)])
+              (if (= y1 y2)
+                  (visible-row-copy-text vt y1 x1 x2 cols)
+                  (string-join
+                   (append
+                    (list (visible-row-copy-text vt y1 x1 cols cols))
+                    (terminal-rows-text vt (+ y1 1) y2 cols)
+                    (list (visible-row-copy-text vt y2 0 x2 cols)))
+                   "\n")))))))
 
 (define (terminal-rows-text vt from to cols)
   (let loop ([y from] [acc '()])
     (if (>= y to)
         (reverse acc)
-        (loop (+ y 1) (cons (terminal-row-text vt y cols) acc)))))
+        (loop (+ y 1) (cons (visible-row-copy-text vt y 0 cols cols) acc)))))
 
 (define (copy-selection! state . maybe-announce)
   (define announce? (if (pair? maybe-announce) (car maybe-announce) #t))

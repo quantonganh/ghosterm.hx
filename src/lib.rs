@@ -16,7 +16,9 @@ use libghostty_vt::Error;
 use libghostty_vt::paste::Options;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::Underline;
-use libghostty_vt::terminal::{ClipboardMime, Mode, ScrollViewport, Terminal};
+use libghostty_vt::terminal::{
+    ClipboardMime, Mode, Point, PointCoordinate, ScrollViewport, Terminal,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use steel::declare_module;
 use steel::rvals::Custom;
@@ -879,6 +881,20 @@ impl VTerm {
         self.iter = None;
     }
 
+    fn capture_and_apply(&mut self) {
+        let Some(frame) = ({
+            let mut state = self.state.borrow_mut();
+            capture_frame(&mut state, &self.term)
+        }) else {
+            return;
+        };
+
+        if let Ok(mut shared) = self.frame.try_borrow_mut() {
+            *shared = frame.clone();
+        }
+        self.apply_frame(frame);
+    }
+
     fn refresh(&mut self) {
         if self.held.get() && self.hold_started.get().elapsed() >= RENDER_HOLD_TIMEOUT {
             let _ = self.term.set_mode(Mode::SYNC_OUTPUT, false);
@@ -891,17 +907,11 @@ impl VTerm {
             return;
         }
 
-        let Some(frame) = ({
-            let mut state = self.state.borrow_mut();
-            capture_frame(&mut state, &self.term)
-        }) else {
-            return;
-        };
+        self.capture_and_apply();
+    }
 
-        if let Ok(mut shared) = self.frame.try_borrow_mut() {
-            *shared = frame.clone();
-        }
-        self.apply_frame(frame);
+    fn refresh_viewport(&mut self) {
+        self.capture_and_apply();
     }
 
     fn advance_bytes(&mut self, data: RVec<u8>) -> bool {
@@ -1110,26 +1120,67 @@ impl VTerm {
             .unwrap_or(0)
     }
 
+    fn screen_row_text(&mut self, row: isize, start: isize, end: isize) -> String {
+        if row < 0 || row > u32::MAX as isize || start < 0 || end <= start {
+            return String::new();
+        }
+
+        let end = end.min(self.cols.max(0) as isize);
+        if end <= start {
+            return String::new();
+        }
+
+        let mut cells = Vec::with_capacity((end - start) as usize);
+        for x in start..end {
+            let mut text = String::new();
+            if x <= u16::MAX as isize {
+                let point = Point::Screen(PointCoordinate {
+                    x: x as u16,
+                    y: row as u32,
+                });
+                if let Ok(grid_ref) = self.term.grid_ref(point) {
+                    let mut buf = ['\0'; 16];
+                    match grid_ref.graphemes(&mut buf) {
+                        Ok(len) => text = buf[..len].iter().collect(),
+                        Err(Error::OutOfSpace { required }) => {
+                            let mut buf = vec!['\0'; required];
+                            if let Ok(len) = grid_ref.graphemes(&mut buf) {
+                                text = buf[..len].iter().collect();
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            cells.push(if text.is_empty() {
+                " ".to_string()
+            } else {
+                text
+            });
+        }
+        cells.concat()
+    }
+
     fn scroll_up(&mut self, amount: isize) {
         self.term
             .scroll_viewport(ScrollViewport::Delta(-amount.max(0)));
-        self.refresh();
+        self.refresh_viewport();
     }
 
     fn scroll_down(&mut self, amount: isize) {
         self.term
             .scroll_viewport(ScrollViewport::Delta(amount.max(0)));
-        self.refresh();
+        self.refresh_viewport();
     }
 
     fn scroll_top(&mut self) {
         self.term.scroll_viewport(ScrollViewport::Top);
-        self.refresh();
+        self.refresh_viewport();
     }
 
     fn scroll_bottom(&mut self) {
         self.term.scroll_viewport(ScrollViewport::Bottom);
-        self.refresh();
+        self.refresh_viewport();
     }
 
     fn title(&self) -> String {
@@ -1161,12 +1212,12 @@ impl VTerm {
 
     fn scroll_prompt_up(&mut self) {
         self.term.scroll_viewport(ScrollViewport::DeltaPrompt(-1));
-        self.refresh();
+        self.refresh_viewport();
     }
 
     fn scroll_prompt_down(&mut self) {
         self.term.scroll_viewport(ScrollViewport::DeltaPrompt(1));
-        self.refresh();
+        self.refresh_viewport();
     }
 }
 
@@ -1215,6 +1266,7 @@ fn create_module() -> FFIModule {
         .register_fn("vte/paste", VTerm::paste)
         .register_fn("vte/mouse-event", VTerm::mouse_event)
         .register_fn("vte/scroll-offset", VTerm::scroll_offset)
+        .register_fn("vte/screen-row-text", VTerm::screen_row_text)
         .register_fn("vte/scroll-up", VTerm::scroll_up)
         .register_fn("vte/scroll-down", VTerm::scroll_down)
         .register_fn("vte/scroll-top", VTerm::scroll_top)
