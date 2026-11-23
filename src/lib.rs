@@ -500,6 +500,26 @@ impl Drop for Pty {
     }
 }
 
+#[cfg(unix)]
+fn ensure_terminfo_dir() -> Option<PathBuf> {
+    const TERMINFO_XTERM_256COLOR: &[u8] = include_bytes!("../terminfo/x/xterm-256color");
+
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| std::env::temp_dir().join("ghosterm-cache"));
+    let directory = cache_root.join("ghosterm").join("terminfo");
+    let target_dir = directory.join("x");
+    fs::create_dir_all(&target_dir).ok()?;
+
+    let target = target_dir.join("xterm-256color");
+    if fs::read(&target).ok().as_deref() != Some(TERMINFO_XTERM_256COLOR) {
+        fs::write(&target, TERMINFO_XTERM_256COLOR).ok()?;
+    }
+
+    Some(directory)
+}
+
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
@@ -525,6 +545,15 @@ fn create_pty_impl(shell: &str, rows: usize, cols: usize) -> Result<Pty> {
     let mut command = CommandBuilder::new(shell);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    #[cfg(unix)]
+    if let Some(terminfo_dir) = ensure_terminfo_dir() {
+        let mut terminfo_dirs = terminfo_dir.as_os_str().to_os_string();
+        terminfo_dirs.push(":");
+        if let Some(existing) = std::env::var_os("TERMINFO_DIRS") {
+            terminfo_dirs.push(existing);
+        }
+        command.env("TERMINFO_DIRS", terminfo_dirs);
+    }
     if let Ok(cwd) = std::env::current_dir() {
         command.cwd(cwd);
     }
