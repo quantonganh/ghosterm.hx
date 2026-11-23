@@ -3,7 +3,7 @@
 (require "helix/misc.scm")
 (require "helix/components.scm")
 (require (prefix-in helix. "helix/commands.scm"))
-(require "expansions.hx/expansions.scm")
+(require "expansions/expansions.scm")
 
 (#%require-dylib "libghosterm"
                  (only-in default-shell
@@ -53,6 +53,25 @@
          terminal-run-config
          terminal-toggle
          terminal-copy-mode)
+
+(define *terminal-message* "")
+(define *terminal-message-generation* 0)
+
+(define (expire-terminal-message! generation)
+  (when (= generation *terminal-message-generation*)
+    (set! *terminal-message* "")
+    (set-status! "")
+    (helix.redraw)))
+
+(define (set-terminal-message! message)
+  (set! *terminal-message* (if message message ""))
+  (set! *terminal-message-generation* (+ *terminal-message-generation* 1))
+  (let ([generation *terminal-message-generation*])
+    (set-status! *terminal-message*)
+    (enqueue-thread-local-callback-with-delay
+     2500
+     (lambda () (expire-terminal-message! generation)))
+    (helix.redraw)))
 
 (define *terminal-shell* (default-shell))
 
@@ -354,7 +373,7 @@
        [(terminal-visible? 'float)
         (focus-terminal! 'float)
         (helix.redraw)]
-       [else (set-status! "No terminal is open")])]
+       [else (set-terminal-message! "No terminal is open")])]
     [(eq? *focused-direction* 'bottom)
      (cond
        [(terminal-visible? 'right)
@@ -449,10 +468,14 @@
       (helix-await-callback
        (pty-read pty)
        (lambda (bytes)
-          (cond
-             [bytes
-              (reset-copy-mode! term)
-              (vte/advance-bytes vt bytes)
+           (cond
+              [bytes
+               (when (copy-mode-active? term)
+                 (set! *terminal-message* "")
+                 (helix.redraw))
+               (reset-copy-mode! term)
+               (vte/advance-bytes vt bytes)
+
 
              (terminal-loop term)]
             [(pty-alive? pty)
@@ -541,13 +564,15 @@
                                border-style
                                "top"
                                "plain"))
-      (render-tab-bar frame
-                      pane
-                      group
-                      focused
-                      border-base
-                      border-style
-                      (style-fg (theme->bg *helix.cx*) Color/Gray))
+       (define tabs-end-x
+         (render-tab-bar frame
+                         pane
+                         group
+                         focused
+                         border-base
+                         border-style
+                         (style-fg (theme->bg *helix.cx*) Color/Gray)))
+       (render-terminal-message-at! frame pane tabs-end-x border-style)
 
 
       (define x-offset (area-x pane))
@@ -583,25 +608,30 @@
    width))
 
 (define (render-tab-bar frame pane group focused border-base border-style dim-style)
-  (define x (+ (area-x pane) 1))
   (define max-x (+ (area-x pane) (area-width pane)))
+  (define count (length (terminal-tabs-list group)))
   (let loop ([tabs (terminal-tabs-list group)]
-             [i 0])
-    (when (pair? tabs)
-      (let* ([label (tab-title-label i (car tabs) pane (length tabs))]
-             [style
-              (cond
-                [(= i (terminal-tabs-active-index group))
-                 (if focused (style-with-bold border-base) border-style)]
-                [else dim-style])])
-        (when (< (+ x (string-length label)) max-x)
-          (frame-set-string! frame x (area-y pane) label style))
-        (set! x (+ x (string-length label)))
-        (when (pair? (cdr tabs))
-          (when (< (+ x 4) max-x)
-            (frame-set-string! frame x (area-y pane) " | " dim-style))
-          (set! x (+ x 4))))
-      (loop (cdr tabs) (+ i 1)))))
+             [i 0]
+             [x (+ (area-x pane) 1)])
+    (if (null? tabs)
+        x
+        (let* ([label (tab-title-label i (car tabs) pane count)]
+               [style
+                (cond
+                  [(= i (terminal-tabs-active-index group))
+                   (if focused (style-with-bold border-base) border-style)]
+                  [else dim-style])]
+               [after-label (+ x (string-length label))]
+               [after-separator
+                (if (pair? (cdr tabs))
+                    (+ after-label 4)
+                    after-label)])
+          (when (< after-label max-x)
+            (frame-set-string! frame x (area-y pane) label style))
+          (when (and (pair? (cdr tabs))
+                     (< (+ after-label 4) max-x))
+            (frame-set-string! frame after-label (area-y pane) " | " dim-style))
+          (loop (cdr tabs) (+ i 1) after-separator)))))
 
 (define (tab-index-at-column group pane col)
   (define x (+ (area-x pane) 1))
@@ -671,8 +701,9 @@
       (define y-offset (area-y pane))
 
        (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
-                               (unbox (Terminal-selection state)))
+                                (unbox (Terminal-selection state)))
 
+       (render-terminal-message! frame pane border-style)
 
       (define cursor (Terminal-cursor state))
       (define cursor-pos (terminal-display-cursor state vt text-rows text-cols))
@@ -736,17 +767,30 @@
     [(<= width 3) (substring text 0 width)]
     [else (string-append (substring text 0 (- width 3)) "...")]))
 
+(define (render-terminal-message! frame pane style)
+  (render-terminal-message-at! frame pane (+ (area-x pane) 1) style))
+
+(define (render-terminal-message-at! frame pane x style)
+  (when (> (string-length *terminal-message*) 0)
+    (define width (- (+ (area-x pane) (area-width pane)) x 1))
+    (when (> width 0)
+      (frame-set-string! frame
+                         x
+                         (area-y pane)
+                         (fit-border-title *terminal-message* width)
+                         style))))
+
 (define (render-float-title! frame pane state style index)
   (define title (terminal-title state))
   (define width (max 0 (- (area-width pane) 2)))
+  (define text (string-append " " (number->string (+ index 1)) ": " title " "))
   (when (> width 0)
     (frame-set-string! frame
                        (+ (area-x pane) 1)
                        (area-y pane)
-                       (fit-border-title
-                        (string-append " " (number->string (+ index 1)) ": " title " ")
-                        width)
-                       style)))
+                       (fit-border-title text width)
+                       style))
+  (+ (area-x pane) 1 (string-length (fit-border-title text width))))
 
 (define (render-float-terminal group state rect frame)
   (define tabs (terminal-tabs-list group))
@@ -822,7 +866,10 @@
        (unless active?
          (set-box! (Terminal-cursor-shown? term) #f))
 
-       (render-float-title! frame pane term border-style index)]))
+        (define title-end-x
+          (render-float-title! frame pane term border-style index))
+        (render-terminal-message-at! frame pane title-end-x border-style)]))
+
 
 
 
@@ -1042,9 +1089,9 @@
       (let ([status (vte/paste (Terminal-vte state) (paste-event-string event))])
         (cond
           [(string=? status "rejected")
-           (set-status! "Unsafe paste rejected")]
+           (set-terminal-message! "Unsafe paste rejected")]
           [(string=? status "error")
-           (set-status! "Paste failed")])
+           (set-terminal-message! "Paste failed")])
         event-result/consume)]
 
     [else event-result/ignore]))
@@ -1248,13 +1295,14 @@
   (set-box! (Terminal-copy-selection-mode state) 'none)
   (set-box! (Terminal-selection state) #f)
   (set-copy-mode-position! state (position-col anchor) (position-row anchor))
-  (set-status! "Copy mode: h/j/k/l move, v select, y copy, Esc exit")
+  (set-terminal-message! "Copy mode: h/j/k/l move, v select, y copy, Esc exit")
   (helix.redraw))
 
 (define (exit-copy-mode! state scroll-bottom?)
   (when scroll-bottom?
     (vte/scroll-bottom (Terminal-vte state)))
   (reset-copy-mode! state)
+  (set-terminal-message! "")
   (helix.redraw))
 
 (define (start-copy-selection! state mode)
@@ -1411,8 +1459,9 @@
       (set-position-row! anchor (position-row cursor))
       (set-box! (Terminal-copy-selection-mode state) 'line)
       (sync-copy-selection! state)))
-  (copy-selection! state)
-  (exit-copy-mode! state #t))
+  (copy-selection! state #f)
+  (exit-copy-mode! state #t)
+  (set-terminal-message! "Copied terminal selection"))
 
 (define (handle-copy-mode-key state event)
   (define c (key-event-char event))
@@ -1703,7 +1752,7 @@
   (define command (terminal-run-command language* buffer-name*))
   (if command
       (terminal-exec-in 'bottom command)
-      (set-status!
+      (set-terminal-message!
         (string-append "No run command configured for " language*))))
 
 (define (terminal-expand-argument value)
@@ -1735,10 +1784,10 @@
 (define (terminal-exec-in direction command)
   (define result (expand command))
   (if (not (hash-ref result 'ok))
-    (set-status! (hash-ref result 'error))
+    (set-terminal-message! (hash-ref result 'error))
     (let ([command (hash-ref result 'text)])
       (if (string=? command "")
-        (set-status! "terminal-exec: missing command")
+        (set-terminal-message! "terminal-exec: missing command")
         (begin
           (show-terminal direction)
           (let ([term (terminal-active-term direction)])
@@ -1914,7 +1963,7 @@
       (set-register! #\+ (list text))
       (set-register! #\* (list text))
       (when announce?
-        (set-status! "Copied terminal selection")))))
+        (set-terminal-message! "Copied terminal selection")))))
 
 (define (float-tab-index-at-click group event)
   (define tabs (terminal-tabs-list group))
