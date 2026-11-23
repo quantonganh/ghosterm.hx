@@ -31,14 +31,20 @@
                           vte/cursor-x
                           vte/cursor-y
                           vte/cursor-visible?
+                          vte/title
+                          vte/pwd
+                          vte/at-prompt?
                           vte/mouse-event
                           vte/scroll-offset
                           vte/scroll-up
                           vte/scroll-down
                           vte/scroll-top
-                          vte/scroll-bottom))
+                          vte/scroll-bottom
+                          vte/scroll-prompt-up
+                          vte/scroll-prompt-down))
 
 (provide terminal
+
          terminal-cycle
          terminal-focus
          terminal-run
@@ -545,8 +551,17 @@
         (set-position-col! cursor (+ x-offset (car cursor-pos))))]))
 
 
+(define (terminal-title state)
+  (define title (vte/title (Terminal-vte state)))
+  (if (string=? title "")
+      (pty-foreground-title (Terminal-pty state))
+      title))
+
+(define (terminal-cwd state)
+  (vte/pwd (Terminal-vte state)))
+
 (define (tab-title-label index state pane count)
-  (define title (pty-foreground-title (Terminal-pty state)))
+  (define title (terminal-title state))
   (define width (max 3 (quotient (area-width pane) (max 1 count))))
   (fit-border-title
    (string-append " " (number->string (+ index 1)) ": " title " ")
@@ -706,8 +721,8 @@
     [(<= width 3) (substring text 0 width)]
     [else (string-append (substring text 0 (- width 3)) "...")]))
 
-(define (render-float-title! frame pane pty style index)
-  (define title (pty-foreground-title pty))
+(define (render-float-title! frame pane state style index)
+  (define title (terminal-title state))
   (define width (max 0 (- (area-width pane) 2)))
   (when (> width 0)
     (frame-set-string! frame
@@ -792,7 +807,8 @@
        (unless active?
          (set-box! (Terminal-cursor-shown? term) #f))
 
-       (render-float-title! frame pane pty border-style index)]))
+       (render-float-title! frame pane term border-style index)]))
+
 
 
 
@@ -1257,6 +1273,14 @@
         (vte/scroll-up vt (- amount)))
     (shift-copy-positions-y! state (- before (vte/scroll-offset vt)))))
 
+(define (copy-mode-prompt-scroll! state up?)
+  (define vt (Terminal-vte state))
+  (define before (vte/scroll-offset vt))
+  (if up?
+      (vte/scroll-prompt-up vt)
+      (vte/scroll-prompt-down vt))
+  (shift-copy-positions-y! state (- before (vte/scroll-offset vt))))
+
 (define (copy-mode-scroll-edge! state top?)
   (define vt (Terminal-vte state))
   (define before (vte/scroll-offset vt))
@@ -1361,12 +1385,15 @@
   (define x (car pos))
   (define y (car (cdr pos)))
   (define ctrl? (ghost-bit? mods 1))
+  (define alt? (ghost-bit? mods 2))
   (define (plain ch)
     (and c
          (or (= mods 0) (= mods 1))
          (char=? c ch)))
   (define (ctrl ch)
     (and c ctrl? (char=? c ch)))
+  (define (alt ch)
+    (and c alt? (not ctrl?) (char=? c ch)))
   (cond
     [(key-event-escape? event) (exit-copy-mode! state #t)]
     [(plain #\q) (exit-copy-mode! state #t)]
@@ -1401,6 +1428,8 @@
     [(ctrl #\f) (copy-mode-scroll! state (max 1 (quotient rows 2)))]
     [(ctrl #\u) (copy-mode-scroll! state (- (max 1 (quotient rows 4))))]
     [(ctrl #\d) (copy-mode-scroll! state (max 1 (quotient rows 4)))]
+    [(alt #\p) (copy-mode-prompt-scroll! state #t)]
+    [(alt #\n) (copy-mode-prompt-scroll! state #f)]
     [else void]))
 
 (define (handle-key-event state event)
@@ -1968,7 +1997,21 @@
 
 ;; Turn a token like src/main.rs:10:5 into the same location string that
 ;; Helix's :open command understands. Trailing colons/commas are ignored.
-(define (location-at-token token)
+(define (starts-with-char? text ch)
+  (and (> (string-length text) 0) (char=? (string-ref text 0) ch)))
+
+(define (absolute-path? path)
+  (or (starts-with-char? path #\/)
+      (starts-with-char? path #\~)
+      (and (>= (string-length path) 2) (char=? (string-ref path 1) #\:))))
+
+(define (qualify-path cwd path)
+  (if (or (string=? cwd "") (absolute-path? path))
+      path
+      (let ([last (string-ref cwd (- (string-length cwd) 1))])
+        (string-append cwd (if (char=? last #\/) "" "/") path))))
+
+(define (location-at-token token cwd)
   (define cleaned (strip-token token))
   (if (string=? cleaned "")
       #f
@@ -1983,11 +2026,11 @@
                   #f
                   (let ([prev (car rest)])
                     (if (digits-only? prev)
-                        (let ([path (string-join (reverse (cdr rest)) ":")])
+                        (let ([path (qualify-path cwd (string-join (reverse (cdr rest)) ":"))])
                           (if (plausible-path? path)
                               (string-append path ":" prev ":" last)
                               #f))
-                        (let ([path (string-join (reverse rest) ":")])
+                        (let ([path (qualify-path cwd (string-join (reverse rest) ":"))])
                           (if (plausible-path? path)
                               (string-append path ":" last)
                               #f))))))))))
@@ -2013,9 +2056,9 @@
       (let* ([line (terminal-row-text (Terminal-vte state) cell-y cols)]
              [token (token-under-click line cell-x)])
         (when token
-          (let ([location (location-at-token token)])
-             (when location
-               (helix.open location)
-               (blur-terminal!))))))))
+          (let ([location (location-at-token token (terminal-cwd state))])
+            (when location
+              (helix.open location)
+              (blur-terminal!))))))))
 
 (install-global-keys!)

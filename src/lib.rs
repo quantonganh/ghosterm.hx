@@ -83,6 +83,41 @@ fn abbreviate_cwd(path: &str) -> String {
     result
 }
 
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn parse_pwd(value: &[u8]) -> String {
+    let text = String::from_utf8_lossy(value);
+    let Some(rest) = text.strip_prefix("file://") else {
+        return text.into_owned();
+    };
+    let Some(slash) = rest.find('/') else {
+        return text.into_owned();
+    };
+    let authority = &rest[..slash];
+    if !authority.is_empty() && authority != "localhost" {
+        return text.into_owned();
+    }
+    percent_decode(&rest[slash..])
+}
+
 #[cfg(target_os = "linux")]
 fn process_for_pgid(pgid: i32) -> Option<i32> {
     let entries = std::fs::read_dir("/proc").ok()?;
@@ -765,7 +800,6 @@ impl VTerm {
         let mut term = Terminal::new(cols, rows).context("unable to create terminal")?;
         term.set_scrollback_max_lines(Some(10000))
             .context("unable to set scrollback")?;
-        term.set_title("ghosterm").context("unable to set title")?;
         term.resize(cols, rows, 8, 16)
             .context("unable to resize terminal")?;
 
@@ -1095,6 +1129,31 @@ impl VTerm {
         self.term.scroll_viewport(ScrollViewport::Bottom);
         self.refresh();
     }
+
+    fn title(&self) -> String {
+        self.term
+            .title()
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .unwrap_or_default()
+    }
+
+    fn pwd(&self) -> String {
+        self.term.pwd().map(parse_pwd).unwrap_or_default()
+    }
+
+    fn at_prompt(&self) -> bool {
+        self.term.is_cursor_at_prompt().unwrap_or(false)
+    }
+
+    fn scroll_prompt_up(&mut self) {
+        self.term.scroll_viewport(ScrollViewport::DeltaPrompt(-1));
+        self.refresh();
+    }
+
+    fn scroll_prompt_down(&mut self) {
+        self.term.scroll_viewport(ScrollViewport::DeltaPrompt(1));
+        self.refresh();
+    }
 }
 
 fn virtual_terminal(pty: &Pty, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
@@ -1136,12 +1195,17 @@ fn create_module() -> FFIModule {
         .register_fn("vte/cursor-x", VTerm::cursor_x)
         .register_fn("vte/cursor-y", VTerm::cursor_y)
         .register_fn("vte/cursor-visible?", VTerm::cursor_visible)
+        .register_fn("vte/title", VTerm::title)
+        .register_fn("vte/pwd", VTerm::pwd)
+        .register_fn("vte/at-prompt?", VTerm::at_prompt)
         .register_fn("vte/mouse-event", VTerm::mouse_event)
         .register_fn("vte/scroll-offset", VTerm::scroll_offset)
         .register_fn("vte/scroll-up", VTerm::scroll_up)
         .register_fn("vte/scroll-down", VTerm::scroll_down)
         .register_fn("vte/scroll-top", VTerm::scroll_top)
-        .register_fn("vte/scroll-bottom", VTerm::scroll_bottom);
+        .register_fn("vte/scroll-bottom", VTerm::scroll_bottom)
+        .register_fn("vte/scroll-prompt-up", VTerm::scroll_prompt_up)
+        .register_fn("vte/scroll-prompt-down", VTerm::scroll_prompt_down);
 
     module
 }
