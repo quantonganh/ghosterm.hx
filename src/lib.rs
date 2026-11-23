@@ -7,7 +7,7 @@ use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::Underline;
-use libghostty_vt::terminal::{ScrollViewport, Terminal};
+use libghostty_vt::terminal::{Mode, ScrollViewport, Terminal};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use steel::declare_module;
 use steel::rvals::Custom;
@@ -928,6 +928,37 @@ impl VTerm {
         self.cursor_visible
     }
 
+    fn mouse_event(&self, button: isize, x: isize, y: isize) -> String {
+        let sgr = self.term.mode(Mode::SGR_MOUSE).unwrap_or(false)
+            || self.term.mode(Mode::SGR_PIXELS_MOUSE).unwrap_or(false);
+        let urxvt = self.term.mode(Mode::URXVT_MOUSE).unwrap_or(false);
+        let tracked = self.term.mode(Mode::NORMAL_MOUSE).unwrap_or(false)
+            || self.term.mode(Mode::BUTTON_MOUSE).unwrap_or(false)
+            || self.term.mode(Mode::ANY_MOUSE).unwrap_or(false)
+            || self.term.mode(Mode::X10_MOUSE).unwrap_or(false)
+            || self.term.mode(Mode::UTF8_MOUSE).unwrap_or(false);
+        if !sgr && !urxvt && !tracked {
+            return String::new();
+        }
+
+        let col = (x.max(0) + 1) as u32;
+        let row = (y.max(0) + 1) as u32;
+        if sgr {
+            return format!("\x1b[<{};{};{}M", button, col, row);
+        }
+        if urxvt {
+            return format!("\x1b[<{};{};{}M", button + 32, col, row);
+        }
+
+        let encode = |value: u32| -> char { char::from_u32(value.clamp(32, 255)).unwrap_or(' ') };
+        format!(
+            "\x1b[M{}{}{}",
+            encode((button + 32) as u32),
+            encode(col + 32),
+            encode(row + 32)
+        )
+    }
+
     fn scroll_offset(&self) -> isize {
         self.term
             .scrollbar()
@@ -997,6 +1028,7 @@ fn create_module() -> FFIModule {
         .register_fn("vte/cursor-x", VTerm::cursor_x)
         .register_fn("vte/cursor-y", VTerm::cursor_y)
         .register_fn("vte/cursor-visible?", VTerm::cursor_visible)
+        .register_fn("vte/mouse-event", VTerm::mouse_event)
         .register_fn("vte/scroll-offset", VTerm::scroll_offset)
         .register_fn("vte/scroll-up", VTerm::scroll_up)
         .register_fn("vte/scroll-down", VTerm::scroll_down)

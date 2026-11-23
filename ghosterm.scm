@@ -31,6 +31,7 @@
                           vte/cursor-x
                           vte/cursor-y
                           vte/cursor-visible?
+                          vte/mouse-event
                           vte/scroll-offset
                           vte/scroll-up
                           vte/scroll-down
@@ -1735,17 +1736,23 @@
                       (list-ref selection 2)
                       (+ (list-ref selection 3) delta))))))
 
-(define (scroll-active-terminal! group kind)
+(define (scroll-active-terminal! group kind event)
   (define state (terminal-tabs-active-term group))
   (when state
-    (define selection (unbox (Terminal-selection state)))
     (define vt (Terminal-vte state))
-    (define before (and selection (vte/scroll-offset vt)))
-    (cond
-      [(= kind 10) (vte/scroll-down vt 3)]
-      [(= kind 11) (vte/scroll-up vt 3)])
-    (when before
-      (shift-selection-y! state (- before (vte/scroll-offset vt))))))
+    (define cell (terminal-cell-at state event))
+    (define button (if (= kind 11) 64 65))
+    (define sequence
+      (and cell (vte/mouse-event vt button (car cell) (car (cdr cell)))))
+    (if (and sequence (not (string=? sequence "")))
+        (pty-write (Terminal-pty state) sequence)
+        (let* ([selection (unbox (Terminal-selection state))]
+               [before (and selection (vte/scroll-offset vt))])
+          (cond
+            [(= kind 10) (vte/scroll-down vt 3)]
+            [(= kind 11) (vte/scroll-up vt 3)])
+          (when before
+            (shift-selection-y! state (- before (vte/scroll-offset vt))))))))
 
 (define (selection->text state selection)
   (define size (unbox (Terminal-size state)))
@@ -1828,7 +1835,8 @@
                     (switch-terminal-tab! direction idx)
                     (focus-terminal! direction)
                     (when (or (= kind 10) (= kind 11))
-                      (scroll-active-terminal! group kind))
+                      (scroll-active-terminal! group kind event))
+
                     (helix.redraw)
                     #t))))
       event-result/consume]
@@ -1878,7 +1886,8 @@
          (when (or (<= kind 2) (= kind 10) (= kind 11))
            (focus-terminal! direction))
          (when (or (= kind 10) (= kind 11))
-           (scroll-active-terminal! group kind))
+           (scroll-active-terminal! group kind event))
+
          (helix.redraw)])
      event-result/consume]))
 
