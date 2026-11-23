@@ -34,6 +34,7 @@
                           vte/title
                           vte/pwd
                           vte/at-prompt?
+                          vte/paste
                           vte/mouse-event
                           vte/scroll-offset
                           vte/scroll-up
@@ -1022,9 +1023,14 @@
      (handle-key-event state event)
      event-result/consume]
 
-    [(paste-event? event)
-     (pty-write (Terminal-pty state) (paste-event-string event))
-     event-result/consume]
+     [(paste-event? event)
+      (let ([status (vte/paste (Terminal-vte state) (paste-event-string event))])
+        (cond
+          [(string=? status "rejected")
+           (set-status! "Unsafe paste rejected")]
+          [(string=? status "error")
+           (set-status! "Paste failed")])
+        event-result/consume)]
 
     [else event-result/ignore]))
 

@@ -12,9 +12,11 @@ use abi_stable::std_types::{RBoxError, RResult, RVec};
 use anyhow::{Context, Result};
 use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
+use libghostty_vt::Error;
+use libghostty_vt::paste::Options;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::Underline;
-use libghostty_vt::terminal::{Mode, ScrollViewport, Terminal};
+use libghostty_vt::terminal::{ClipboardMime, Mode, ScrollViewport, Terminal};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use steel::declare_module;
 use steel::rvals::Custom;
@@ -1145,6 +1147,18 @@ impl VTerm {
         self.term.is_cursor_at_prompt().unwrap_or(false)
     }
 
+    fn paste(&mut self, text: &str) -> String {
+        let mimes = [ClipboardMime::new(b"text/plain")];
+        match self.term.paste(Options::new(), &mimes, |_mime, out| {
+            out.write_all(text.as_bytes())
+        }) {
+            Ok(true) => "ok".to_string(),
+            Ok(false) => "empty".to_string(),
+            Err(Error::Rejected) => "rejected".to_string(),
+            Err(_) => "error".to_string(),
+        }
+    }
+
     fn scroll_prompt_up(&mut self) {
         self.term.scroll_viewport(ScrollViewport::DeltaPrompt(-1));
         self.refresh();
@@ -1198,6 +1212,7 @@ fn create_module() -> FFIModule {
         .register_fn("vte/title", VTerm::title)
         .register_fn("vte/pwd", VTerm::pwd)
         .register_fn("vte/at-prompt?", VTerm::at_prompt)
+        .register_fn("vte/paste", VTerm::paste)
         .register_fn("vte/mouse-event", VTerm::mouse_event)
         .register_fn("vte/scroll-offset", VTerm::scroll_offset)
         .register_fn("vte/scroll-up", VTerm::scroll_up)
