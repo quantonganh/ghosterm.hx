@@ -99,6 +99,19 @@
         (max 1 (quotient (area-height area) 2))
         24)))
 
+(define (default-terminal-width)
+  (let ([area (editor-focused-buffer-area)])
+    (if area
+        (max 1 (quotient (* (area-width area) 3) 10))
+        30)))
+
+(define (terminal-dock-size direction)
+  (max 2
+       (+ 1
+          (cond
+            [(eq? direction 'right) (or *terminal-width* (default-terminal-width))]
+            [else (or *terminal-height* (default-terminal-height))]))))
+
 (define (terminal . args)
   (define direction (direction-argument args 'bottom))
   (define rest (command-arguments args))
@@ -181,13 +194,7 @@
       (cdr args)
       args))
 
-(define (set-editor-clip! direction amount)
-  (cond
-    [(eq? direction 'right) (set-editor-clip-right! amount)]
-    [(eq? direction 'bottom) (set-editor-clip-bottom! amount)]
-    [else void]))
-
-(struct TerminalTabs (direction tabs active pushed?))
+(struct TerminalTabs (direction tabs active pushed? dock-size))
 
 (define (terminal-tabs-list group)
   (unbox (TerminalTabs-tabs group)))
@@ -300,7 +307,12 @@
   (define group (terminal-get direction))
 
   (unless group
-    (set! group (TerminalTabs direction (box '()) (box 0) (box #f)))
+    (set! group
+          (TerminalTabs direction
+                        (box '())
+                        (box 0)
+                        (box #f)
+                        (box (terminal-dock-size direction))))
     (terminal-put! direction group))
 
   (when (null? (terminal-tabs-list group))
@@ -333,9 +345,21 @@
   (helix.redraw))
 
 (define (component-functions group)
-    (define with-handle
-        (hash-insert (hash) "handle_event" terminal-event-handler))
-    (hash-insert with-handle "cursor" terminal-cursor-handler))
+  (define direction (TerminalTabs-direction group))
+  (define with-handle
+      (hash-insert (hash) "handle_event" terminal-event-handler))
+  (define with-cursor (hash-insert with-handle "cursor" terminal-cursor-handler))
+  (cond
+    [(or (eq? direction 'bottom) (eq? direction 'right))
+     (hash-insert with-cursor
+                  "placement"
+                   (lambda (_)
+                     (list 'dock
+                           (if (eq? direction 'right) 'right 'bottom)
+                           (unbox (TerminalTabs-dock-size group))
+                           (if (eq? direction 'right) 0 1))))]
+
+    [else with-cursor]))
 
 (define (terminal-loop-alive? term)
   (and term (not (unbox (Terminal-kill-switch term)))))
@@ -502,7 +526,9 @@
           [(eq? direction 'right) (render-right-terminal group state rect frame)]
           [(eq? direction 'float) (render-float-terminal group state rect frame)]
           [else (render-bottom-terminal group state rect frame)])
-        (set-editor-clip! direction 0))))
+          void)))
+
+
 
 (define (terminal-display-cursor state vt rows cols)
   (if (unbox (Terminal-copy-mode? state))
@@ -520,12 +546,10 @@
              (list x y)))))
 
 (define (render-bottom-terminal group state rect frame)
-  (define pane (terminal-pane-area rect))
+  (define pane rect)
 
   (cond
-    [(not pane)
-     ;; Not enough room to reserve a safe editor area.
-     (set-editor-clip-bottom! 0)]
+    [(or (< (area-height pane) 2) (< (area-width pane) 1)) void]
 
     [else
      (define vt (Terminal-vte state))
@@ -533,20 +557,19 @@
      (define focused (unbox (Terminal-focused? state)))
 
      (define text-rows (max 1 (- (area-height pane) 1)))
-     (define cols (max 1 (area-width pane)))
+      (define cols (max 1 (area-width pane)))
 
-     ;; Reserve the bottom pane.
-     (set-editor-clip-bottom! (- (area-height pane) 1))
-     (set-box! (Terminal-area state) pane)
+      (set-box! (Terminal-area state) pane)
 
-     ;; Resize only when dimensions change.
+      ;; Resize only when dimensions change.
+
      (define target-size (list text-rows cols))
      (unless (equal? (unbox (Terminal-size state)) target-size)
         (set-box! (Terminal-size state) target-size)
-        (reset-copy-mode! state)
+                (reset-copy-mode! state)
         (vte/resize vt text-rows cols)
-
-       (pty-resize pty text-rows cols))
+        (pty-resize pty text-rows cols)
+)
 
      (define theme-fg
        (or (style->fg (theme->fg *helix.cx*)) Color/White))
@@ -560,29 +583,28 @@
      (buffer/clear frame pane)
      (block/render frame
                    pane
-                   (make-block (theme->bg *helix.cx*)
-                               border-style
-                               "top"
-                               "plain"))
-       (define tabs-end-x
-         (render-tab-bar frame
-                         pane
-                         group
-                         focused
-                         border-base
-                         border-style
-                         (style-fg (theme->bg *helix.cx*) Color/Gray)))
-       (render-terminal-message-at! frame pane tabs-end-x border-style)
-
+                    (make-block (theme->bg *helix.cx*)
+                                border-style
+                                "top"
+                                "plain"))
+      (define tabs-end-x
+        (render-tab-bar frame
+                        pane
+                        group
+                        focused
+                        border-base
+                        border-style
+                        (style-fg (theme->bg *helix.cx*) Color/Gray)))
+      (render-terminal-message-at! frame pane tabs-end-x border-style)
 
       (define x-offset (area-x pane))
       (define y-offset (+ (area-y pane) 1))
 
-       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
-                               (unbox (Terminal-selection state)))
-
+      (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                              (unbox (Terminal-selection state)))
 
       (define cursor (Terminal-cursor state))
+
       (define cursor-pos (terminal-display-cursor state vt text-rows cols))
       (define cursor-shown? (and focused cursor-pos))
       (set-box! (Terminal-cursor-shown? state) cursor-shown?)
@@ -656,11 +678,10 @@
 
 
 (define (render-right-terminal _group state rect frame)
-  (define pane (terminal-pane-area-right rect))
+  (define pane rect)
 
   (cond
-    [(not pane)
-     (set-editor-clip-right! 0)]
+    [(or (< (area-width pane) 2) (< (area-height pane) 1)) void]
 
     [else
      (define vt (Terminal-vte state))
@@ -668,18 +689,17 @@
      (define focused (unbox (Terminal-focused? state)))
 
      (define text-cols (max 1 (- (area-width pane) 1)))
-     (define text-rows (max 1 (area-height pane)))
+      (define text-rows (max 1 (area-height pane)))
 
-     (set-editor-clip-right! (- (area-width pane) 1))
-     (set-box! (Terminal-area state) pane)
+      (set-box! (Terminal-area state) pane)
 
-     (define target-size (list text-rows text-cols))
-     (unless (equal? (unbox (Terminal-size state)) target-size)
+      (define target-size (list text-rows text-cols))
+      (unless (equal? (unbox (Terminal-size state)) target-size)
         (set-box! (Terminal-size state) target-size)
         (reset-copy-mode! state)
         (vte/resize vt text-rows text-cols)
+        (pty-resize pty text-rows text-cols))
 
-       (pty-resize pty text-rows text-cols))
 
      (define theme-fg
        (or (style->fg (theme->fg *helix.cx*)) Color/White))
@@ -695,17 +715,18 @@
                    (make-block (theme->bg *helix.cx*)
                                border-style
                                "left"
-                               "plain"))
+                                "plain"))
 
       (define x-offset (+ (area-x pane) 1))
       (define y-offset (area-y pane))
 
-       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
-                                (unbox (Terminal-selection state)))
+      (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
+                              (unbox (Terminal-selection state)))
 
-       (render-terminal-message! frame pane border-style)
+      (render-terminal-message! frame pane border-style)
 
       (define cursor (Terminal-cursor state))
+
       (define cursor-pos (terminal-display-cursor state vt text-rows text-cols))
       (define cursor-shown? (and focused cursor-pos))
       (set-box! (Terminal-cursor-shown? state) cursor-shown?)
@@ -815,18 +836,17 @@
      (define focused (unbox (Terminal-focused? term)))
 
      (define text-rows (max 1 (- (area-height pane) 2)))
-     (define text-cols (max 1 (- (area-width pane) 2)))
+      (define text-cols (max 1 (- (area-width pane) 2)))
 
-     (set-editor-clip-bottom! 0)
-     (set-box! (Terminal-area term) pane)
+      (set-box! (Terminal-area term) pane)
 
-     (define target-size (list text-rows text-cols))
-     (unless (equal? (unbox (Terminal-size term)) target-size)
+      (define target-size (list text-rows text-cols))
+      (unless (equal? (unbox (Terminal-size term)) target-size)
         (set-box! (Terminal-size term) target-size)
         (reset-copy-mode! term)
         (vte/resize vt text-rows text-cols)
+        (pty-resize pty text-rows text-cols))
 
-       (pty-resize pty text-rows text-cols))
 
      (define theme-fg
        (or (style->fg (theme->fg *helix.cx*)) Color/White))
@@ -962,46 +982,6 @@
   (Color/rgb (quotient value 65536)
              (quotient (modulo value 65536) 256)
              (modulo value 256)))
-
-(define (terminal-pane-area rect)
-  (define total (area-height rect))
-  (define max-rows (max 0 (- total 5)))
-  (if (< max-rows 1)
-      #f
-      (begin
-        (define rows
-          (if *terminal-height*
-              (min (max 1 *terminal-height*) max-rows)
-              ;; Split the rows left after the statusline and pane border
-              ;; evenly between the editor and the terminal.
-              (min (max 1 (quotient (- total 2) 2)) max-rows)))
-        (define pane-height (+ rows 1))
-        (define y (- total pane-height))
-        (define width (- (area-width rect) (right-pane-width rect)))
-        (area (area-x rect) y width pane-height))))
-
-(define (terminal-pane-area-right rect)
-  (define total-width (area-width rect))
-  (define max-cols (max 0 (- total-width 20)))
-  (if (< max-cols 1)
-      #f
-      (begin
-        (define cols
-          (if *terminal-width*
-              (min (max 1 *terminal-width*) max-cols)
-              (min (max 1 (quotient (* total-width 3) 10)) max-cols)))
-        (define pane-width (+ cols 1))
-        (area (+ (area-x rect) (- total-width pane-width))
-              (area-y rect)
-              pane-width
-              (area-height rect)))))
-
-(define (right-pane-width rect)
-  (define term (terminal-active-term 'right))
-  (if (and term (unbox (Terminal-active term)))
-      (let ([pane (terminal-pane-area-right rect)])
-        (if pane (area-width pane) 0))
-      0))
 
 (define (terminal-event-handler group event)
   (define direction (TerminalTabs-direction group))
@@ -1654,7 +1634,6 @@
         (set! *focused-direction* #f))
       (restore-editor-cursor!)
       (auto-reload-editor!))
-    (set-editor-clip! direction 0)
     (helix.redraw)))
 
 (define (close-terminal-tab direction)
@@ -1682,8 +1661,8 @@
                     (when (eq? *focused-direction* direction)
                       (set! *focused-direction* #f))
                     (restore-editor-cursor!)
-                    (auto-reload-editor!))
-                  (set-editor-clip! direction 0))
+                    (auto-reload-editor!)))
+
                 (begin
                   (set-box! (TerminalTabs-active group)
                             (min index (- (length remaining) 1)))
