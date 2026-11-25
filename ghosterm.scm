@@ -1624,16 +1624,24 @@
 
 (define (hide-terminal direction)
   (define term (terminal-active-term direction))
+  (define group (terminal-get direction))
+
   (when term
     (define was-focused? (unbox (Terminal-focused? term)))
     (set-terminal-focused! term #f)
     (set-box! (Terminal-active term) #f)
     (reset-copy-mode! term)
+
+    (when (and group (unbox (TerminalTabs-pushed? group)))
+      (pop-last-component! (component-name direction))
+      (set-box! (TerminalTabs-pushed? group) #f))
+
     (when was-focused?
       (when (eq? *focused-direction* direction)
         (set! *focused-direction* #f))
       (restore-editor-cursor!)
       (auto-reload-editor!))
+
     (helix.redraw)))
 
 (define (close-terminal-tab direction)
