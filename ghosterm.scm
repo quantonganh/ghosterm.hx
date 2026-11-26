@@ -3,6 +3,7 @@
 (require "helix/misc.scm")
 (require "helix/components.scm")
 (require (prefix-in helix. "helix/commands.scm"))
+(require (prefix-in helix.static. "helix/static.scm"))
 (require "expansions/expansions.scm")
 
 (#%require-dylib "libghosterm"
@@ -1440,8 +1441,19 @@
       (set-box! (Terminal-copy-selection-mode state) 'line)
       (sync-copy-selection! state)))
   (copy-selection! state #f)
-  (exit-copy-mode! state #t)
-  (set-terminal-message! "Copied terminal selection"))
+  (exit-copy-mode! state #t))
+
+(define (copy-mode-write! state)
+  (define selection (unbox (Terminal-selection state)))
+  (when (or (not selection) (selection-empty? selection))
+    (let* ([cursor (Terminal-copy-cursor state)]
+           [anchor (Terminal-copy-anchor state)])
+      (set-position-col! anchor (position-col cursor))
+      (set-position-row! anchor (position-row cursor))
+      (set-box! (Terminal-copy-selection-mode state) 'line)
+      (sync-copy-selection! state)))
+  (write-selection-to-scratch! state)
+  (exit-copy-mode! state #t))
 
 (define (handle-copy-mode-key state event)
   (define c (key-event-char event))
@@ -1466,6 +1478,7 @@
     [(key-event-escape? event) (exit-copy-mode! state #t)]
     [(plain #\q) (exit-copy-mode! state #t)]
     [(plain #\y) (copy-mode-yank! state)]
+    [(plain #\w) (copy-mode-write! state)]
     [(plain #\v) (start-copy-selection! state 'cell)]
     [(plain #\V) (start-copy-selection! state 'line)]
     [(ctrl #\v) (start-copy-selection! state 'cell)]
@@ -1951,6 +1964,18 @@
       (set-register! #\* (list text))
       (when announce?
         (set-terminal-message! "Copied terminal selection")))))
+
+(define (write-selection-to-scratch! state)
+  (define selection (unbox (Terminal-selection state)))
+  (when (and selection (not (selection-empty? selection)))
+    (define text (selection->text state selection))
+    (unless (string=? text "")
+      (enqueue-thread-local-callback
+       (lambda ()
+         (helix.new)
+         (helix.static.insert_string text)
+         (blur-terminal!)
+         (set-terminal-message! "Wrote terminal selection to scratch buffer"))))))
 
 (define (float-tab-index-at-click group event)
   (define tabs (terminal-tabs-list group))
