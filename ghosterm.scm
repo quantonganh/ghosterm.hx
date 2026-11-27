@@ -414,6 +414,40 @@
            (focus-terminal! 'float)
            (helix.redraw))
          (blur-terminal!))]
+     [else
+      (blur-terminal!)]))
+
+(define (terminal-cycle-prev)
+  (cond
+    [(not *focused-direction*)
+     (cond
+       [(terminal-visible? 'float)
+        (focus-terminal! 'float)
+        (helix.redraw)]
+       [(terminal-visible? 'right)
+        (focus-terminal! 'right)
+        (helix.redraw)]
+       [(terminal-visible? 'bottom)
+        (focus-terminal! 'bottom)
+        (helix.redraw)]
+       [else (set-terminal-message! "No terminal is open")])]
+    [(eq? *focused-direction* 'bottom)
+     (blur-terminal!)]
+    [(eq? *focused-direction* 'right)
+     (if (terminal-visible? 'bottom)
+         (begin
+           (focus-terminal! 'bottom)
+           (helix.redraw))
+         (blur-terminal!))]
+    [(eq? *focused-direction* 'float)
+     (cond
+       [(terminal-visible? 'right)
+        (focus-terminal! 'right)
+        (helix.redraw)]
+       [(terminal-visible? 'bottom)
+        (focus-terminal! 'bottom)
+        (helix.redraw)]
+       [else (blur-terminal!)])]
     [else
      (blur-terminal!)]))
 
@@ -1015,9 +1049,14 @@
     [(mouse-event? event)
      (handle-mouse-event group event)]
 
-    ;; Ctrl-\: cycle focus editor -> bottom -> right -> editor.
+    ;; Ctrl-[ / Esc: previous pane; Ctrl-] / Ctrl-5: next pane.
     [(and (key-event? event)
-          (terminal-focus-editor-trigger? event))
+          (terminal-cycle-prev-trigger? event))
+     (terminal-cycle-prev)
+     event-result/consume]
+
+    [(and (key-event? event)
+          (terminal-cycle-next-trigger? event))
      (terminal-cycle)
      event-result/consume]
 
@@ -1084,7 +1123,7 @@
          (and actual (char=? actual c)))))
 
 (define (terminal-new-tab-trigger? event)
-  (terminal-alt-key? event #\t))
+  (terminal-ctrl-key? event #\t))
 
 (define (terminal-new-float-trigger? event)
   (and (key-event? event)
@@ -1109,28 +1148,6 @@
               (<= code (char->integer #\9))
               (- code (char->integer #\1))))))
 
-(define (terminal-toggle-trigger? event)
-  (let ([mods (or (key-event-modifier event) 0)]
-        [c (key-event-char event)])
-    (and c
-        (or (= (char->integer c) 31)
-            (and (ghost-bit? mods 1)
-                 (or (char=? c #\7)
-                     (char=? c #\/)))))))
-
-(define (terminal-ctrl-key-code? event code)
-  (and (key-event? event)
-       (let ([mods (or (key-event-modifier event) 0)]
-             [actual (key-event-char event)])
-         (and actual
-              (ghost-bit? mods 1)
-              (= (char->integer actual) code)))))
-
-(define (terminal-toggle-right-trigger? event)
-  (or (terminal-ctrl-key-code? event (char->integer #\]))
-      (terminal-ctrl-key-code? event (char->integer #\5))
-      (terminal-ctrl-key-code? event 29)))
-
 (define (terminal-editor-apostrophe-trigger? event)
   (and (key-event? event)
        (or (and (not *focused-direction*)
@@ -1141,12 +1158,66 @@
              [actual (key-event-char event)])
          (and actual
               (= mods 0)
-              (= (char->integer actual) 39)))))
+              (char=? actual #\')))))
+
+(define (terminal-toggle-trigger? event)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [c (key-event-char event)])
+    (and c
+        (or (= (char->integer c) 31)
+            (and (ghost-bit? mods 1)
+                 (or (char=? c #\7)
+                     (char=? c #\/)
+                     (char=? c #\')))
+            (terminal-editor-apostrophe-trigger? event)))))
+
+(define (terminal-ctrl-key? event ch)
+  (and (key-event? event)
+       (let ([mods (or (key-event-modifier event) 0)]
+             [actual (key-event-char event)])
+         (and actual
+              (ghost-bit? mods 1)
+              (char=? actual ch)))))
+
+(define (terminal-toggle-right-trigger? event)
+  (let ([mods (or (key-event-modifier event) 0)]
+        [c (key-event-char event)])
+    (and c
+        (or (= (char->integer c) 28)
+            (and (ghost-bit? mods 1)
+                 (or (char=? c #\4)
+                     (char=? c #\\)))))))
+
+(define (terminal-any-visible?)
+  (or (terminal-visible? 'bottom)
+      (terminal-visible? 'right)
+      (terminal-visible? 'float)))
+
+(define (terminal-copy-mode-active-anywhere?)
+  (and *focused-direction*
+       (let ([term (terminal-active-term *focused-direction*)])
+         (and term (copy-mode-active? term)))))
+
+(define (terminal-cycle-prev-trigger? event)
+  (or (terminal-ctrl-key? event #\[)
+      (and (key-event-escape? event)
+           (equal? (editor-mode) "normal")
+           (terminal-any-visible?)
+           (not (terminal-copy-mode-active-anywhere?)))))
+
+(define (terminal-cycle-next-trigger? event)
+  (or (terminal-ctrl-key? event #\])
+      (terminal-ctrl-key? event #\5)))
 
 (define (terminal-toggle-float-trigger? event)
-  (or (terminal-ctrl-key-code? event (char->integer #\'))
-      (terminal-ctrl-key-code? event 39)
-      (terminal-editor-apostrophe-trigger? event)))
+  (or (terminal-ctrl-key? event #\f)
+      (terminal-ctrl-key? event #\`)
+      (and (key-event? event)
+           (ghost-bit? (or (key-event-modifier event) 0) 1)
+           (let ([c (key-event-char event)])
+             (and c
+                  (or (= (char->integer c) 0)
+                      (= (char->integer c) 32)))))))
 
 (define (terminal-global-key-handler _ event)
   (cond
@@ -1160,6 +1231,14 @@
 
     [(terminal-toggle-float-trigger? event)
      (toggle-terminal 'float)
+     event-result/consume]
+
+    [(terminal-cycle-prev-trigger? event)
+     (terminal-cycle-prev)
+     event-result/consume]
+
+    [(terminal-cycle-next-trigger? event)
+     (terminal-cycle)
      event-result/consume]
 
     [(terminal-new-float-trigger? event)
@@ -1189,15 +1268,6 @@
               (ghost-bit? mods 1)
               (or (char=? c #\x)
                   (char=? c #\X))))))
-
-(define (terminal-focus-editor-trigger? event)
-  (let ([mods (or (key-event-modifier event) 0)]
-        [c (key-event-char event)])
-    (and c
-        (or (= (char->integer c) 28)
-            (and (ghost-bit? mods 1)
-                 (or (char=? c #\4)
-                     (char=? c #\\)))))))
 
 (define (terminal-cursor-handler group _rect)
   (define state (terminal-tabs-active-term group))
