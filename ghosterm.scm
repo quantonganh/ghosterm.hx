@@ -580,6 +580,102 @@
              (>= y 0) (< y rows)
              (list x y)))))
 
+(define (terminal-border-active-style)
+  (style-fg (theme->bg *helix.cx*)
+            (or (style->fg (theme->fg *helix.cx*)) Color/White)))
+
+(define (terminal-border-inactive-style)
+  (style-fg (theme->bg *helix.cx*) Color/Gray))
+
+(define (terminal-visible-pane-count)
+  (let loop ([directions '(bottom right float)]
+             [count 0])
+    (if (null? directions)
+        count
+        (loop (cdr directions)
+              (if (terminal-visible? (car directions))
+                  (+ count 1)
+                  count)))))
+
+(define (terminal-focused? direction)
+  (define term (terminal-active-term direction))
+  (and term (unbox (Terminal-focused? term))))
+
+(define (terminal-current-dock-size direction)
+  (define group (terminal-get direction))
+  (if group
+      (unbox (TerminalTabs-dock-size group))
+      (terminal-dock-size direction)))
+
+(define (bottom-border-row fallback)
+  (define term (terminal-active-term 'bottom))
+  (define area (and term (unbox (Terminal-area term))))
+  (if area
+      (area-y area)
+      fallback))
+
+(define (draw-horizontal-border! frame x y width style)
+  (let loop ([column x]
+             [remaining width])
+    (when (> remaining 0)
+      (frame-set-string! frame column y "─" style)
+      (loop (+ column 1) (- remaining 1)))))
+
+(define (draw-vertical-border! frame x y height style)
+  (let loop ([row y]
+             [remaining height])
+    (when (> remaining 0)
+      (frame-set-string! frame x row "│" style)
+      (loop (+ row 1) (- remaining 1)))))
+
+(define (render-pane-borders! frame pane direction focused)
+  (when (terminal-visible? direction)
+    (define active-style (terminal-border-active-style))
+    (define inactive-style (terminal-border-inactive-style))
+    (define editor-active? (not *focused-direction*))
+    (define bottom-active? (and (terminal-visible? 'bottom)
+                                (terminal-focused? 'bottom)))
+    (define count (terminal-visible-pane-count))
+    (define x (area-x pane))
+    (define y (area-y pane))
+    (define width (area-width pane))
+    (define height (area-height pane))
+    (cond
+       [(eq? direction 'bottom)
+        (define style (if (or focused editor-active?) active-style inactive-style))
+        (if (> count 1)
+            (draw-horizontal-border! frame x y width style)
+            (let* ([midpoint (quotient width 2)]
+                   [first-style (if focused inactive-style active-style)]
+                   [second-style (if focused active-style inactive-style)])
+              (draw-horizontal-border! frame x y midpoint first-style)
+              (draw-horizontal-border! frame (+ x midpoint) y (- width midpoint) second-style)))]
+       [(eq? direction 'right)
+        (define top-style (if (or focused editor-active?) active-style inactive-style))
+        (if (> count 1)
+            (if (terminal-visible? 'bottom)
+                (let* ([junction-y (bottom-border-row (- (+ y height)
+                                                          (terminal-current-dock-size 'bottom)))]
+                       [bottom-style (if (or focused bottom-active?)
+                                         active-style
+                                         inactive-style)]
+                        [junction-style (if (or focused editor-active? bottom-active?)
+                                            active-style
+                                            inactive-style)])
+                   (draw-vertical-border! frame x y (- junction-y y) top-style)
+                   (draw-vertical-border! frame x (+ junction-y 1)
+                                          (- (- (+ y height) junction-y) 1)
+                                          bottom-style)
+                   (frame-set-string! frame x junction-y "┤" junction-style))
+
+                (draw-vertical-border! frame x y height top-style))
+            (let* ([midpoint (quotient height 2)]
+                   [first-style (if focused inactive-style active-style)]
+                   [second-style (if focused active-style inactive-style)])
+              (draw-vertical-border! frame x y midpoint first-style)
+              (draw-vertical-border! frame x (+ y midpoint) (- height midpoint) second-style)))])))
+
+
 (define (render-bottom-terminal group state rect frame)
   (define pane rect)
 
@@ -606,24 +702,26 @@
         (pty-resize pty text-rows cols)
 )
 
-     (define theme-fg
-       (or (style->fg (theme->fg *helix.cx*)) Color/White))
-     (define theme-bg
-       (or (style->bg (theme->bg *helix.cx*)) Color/Black))
-     (define border-fg theme-fg)
-     (define border-base (style-fg (theme->bg *helix.cx*) border-fg))
-     (define border-style
-       (if focused border-base (style-with-dim border-base)))
+      (define theme-fg
+        (or (style->fg (theme->fg *helix.cx*)) Color/White))
+      (define theme-bg
+        (or (style->bg (theme->bg *helix.cx*)) Color/Black))
+      (define border-base (terminal-border-active-style))
+      (define border-style
+        (if focused border-base (terminal-border-inactive-style)))
+
 
      (buffer/clear frame pane)
-     (block/render frame
-                   pane
-                    (make-block (theme->bg *helix.cx*)
-                                border-style
-                                "top"
-                                "plain"))
-      (define tabs-end-x
+      (block/render frame
+                    pane
+                     (make-block (theme->bg *helix.cx*)
+                                 border-style
+                                 ""
+                                 "plain"))
+       (render-pane-borders! frame pane 'bottom focused)
+       (define tabs-end-x
         (render-tab-bar frame
+
                         pane
                         group
                         focused
@@ -736,23 +834,26 @@
         (pty-resize pty text-rows text-cols))
 
 
-     (define theme-fg
-       (or (style->fg (theme->fg *helix.cx*)) Color/White))
-     (define theme-bg
-       (or (style->bg (theme->bg *helix.cx*)) Color/Black))
-     (define border-base (style-fg (theme->bg *helix.cx*) theme-fg))
-     (define border-style
-       (if focused border-base (style-with-dim border-base)))
+      (define theme-fg
+        (or (style->fg (theme->fg *helix.cx*)) Color/White))
+      (define theme-bg
+        (or (style->bg (theme->bg *helix.cx*)) Color/Black))
+      (define border-base (terminal-border-active-style))
+      (define border-style
+        (if focused border-base (terminal-border-inactive-style)))
+
 
      (buffer/clear frame pane)
-     (block/render frame
-                   pane
-                   (make-block (theme->bg *helix.cx*)
-                               border-style
-                               "left"
-                                "plain"))
+      (block/render frame
+                    pane
+                    (make-block (theme->bg *helix.cx*)
+                                border-style
+                                ""
+                                 "plain"))
+      (render-pane-borders! frame pane 'right focused)
 
-      (define x-offset (+ (area-x pane) 1))
+       (define x-offset (+ (area-x pane) 1))
+
       (define y-offset (area-y pane))
 
       (render-terminal-cells! vt frame x-offset y-offset theme-fg theme-bg
@@ -887,20 +988,24 @@
        (or (style->fg (theme->fg *helix.cx*)) Color/White))
      (define theme-bg
        (or (style->bg (theme->bg *helix.cx*)) Color/Black))
-      (define border-base (style-fg (theme->bg *helix.cx*) theme-fg))
-      (define border-style
-        (if (and focused active?)
-            border-base
-            (style-fg (theme->bg *helix.cx*) Color/Gray)))
+       (define border-base (terminal-border-active-style))
+        (define border-style
+          (if (and focused active?)
+              border-base
+              (style-fg (theme->bg *helix.cx*) Color/Gray)))
+
+
 
       (buffer/clear frame pane)
 
        (block/render frame
                pane
-                (make-block (theme->bg *helix.cx*)
-                            border-style
-                            "all"
-                            "rounded"))
+                 (make-block (theme->bg *helix.cx*)
+                             border-style
+                             "all"
+                             "rounded"))
+
+
 
 
        (define x-offset (+ (area-x pane) 1))
